@@ -7,7 +7,6 @@ Run Script inside of the Cinema 4D Run script command.
 
 
 Material Creator v001
-Developed by isintan kursun with the assistance of ChatGPT.
 This script creates a Redshift Standard Material in Cinema 4D based on user input.
 For each texture channel (BaseColor, Roughness, Normal, Displacement), if the checkbox is enabled
 (i.e. a file path is provided), then a texture sampler node and its corresponding processing chain
