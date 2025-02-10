@@ -1,21 +1,36 @@
 """
 Material Creator v001
-This script creates a Redshift Standard Material in Cinema 4D based on user input.
-For each texture channel (BaseColor, Roughness, Normal, Displacement), if the checkbox is enabled
-(i.e. a file path is provided), then a texture sampler node and its corresponding processing chain
-are created and connected:
-  - BaseColor: Texture Sampler → ColorCorrect → Standard Material (base_color)
-  - Roughness: Texture Sampler → Ramp → Standard Material (refl_roughness)
-  - Normal:    Texture Sampler → Bump Map → Standard Material (bump_input)
-  - Displacement: Texture Sampler → Displacement → Output node (displacement)
-If the dialog is closed without clicking "Create Material", no material is created.
-Additionally, 3D objects (.fbx/.obj) in the selected folder can be imported and assigned the created material.
+This script scans a selected folder for texture files for each channel (BaseColor, Roughness, Normal, Displacement)
+using case‑ and underscore‑insensitive matching. It groups the files by a common identifier (the file name with the 
+channel keyword removed) so that for every identifier common to all enabled channels a complete texture set exists.
+For every complete set a Redshift Standard Material is created (with the material name suffixed by the identifier 
+if non‑empty). If the "Import 3D Model" option is enabled, the script simply merges the 3D objects from the folder 
+without assigning any material.
+If you close the dialog without clicking "Create Material", no material is created.
 """
 
 import c4d
 import maxon
 import os
 from c4d import gui, storage
+
+# --------------------------------------------------
+# Helper: Extract identifier from filename for a given channel
+# --------------------------------------------------
+def get_texture_identifier(file_name, channel):
+    """
+    Given a file name and a channel (e.g. "BaseColor"),
+    removes the extension and underscores and checks if the resulting name ends with the channel keyword.
+    If yes, returns the remaining prefix (the identifier) after stripping; otherwise returns None.
+    """
+    base = os.path.splitext(file_name)[0]
+    base_norm = base.lower().replace("_", "")
+    channel_norm = channel.lower().replace("_", "")
+    if base_norm.endswith(channel_norm):
+        ident = base_norm[:-len(channel_norm)]
+        return ident.strip()  # May be empty if nothing precedes the channel keyword.
+    else:
+        return None
 
 # --------------------------------------------------
 # Helper functions for object processing
@@ -29,38 +44,28 @@ def get_all_objects(obj):
         obj = obj.GetNext()
     return result
 
-def assign_material_recursive(obj, material):
-    """Recursively assigns the material to obj and its children using a texture tag with UVW projection."""
-    if obj is None:
-        return
-    tag = obj.MakeTag(c4d.Ttexture)
-    if tag:
-        tag[c4d.TEXTURETAG_MATERIAL] = material
-        tag[c4d.TEXTURETAG_PROJECTION] = c4d.TEXTURETAG_PROJECTION_UVW
-    child = obj.GetDown()
-    while child:
-        assign_material_recursive(child, material)
-        child = child.GetNext()
+# (Note: The material assignment to imported objects has been removed.)
 
 # --------------------------------------------------
 # Material Creation Function (Conditional Node Creation)
 # --------------------------------------------------
 def create_redshift_material(file_paths):
     """
-    Creates a Redshift Standard Material and conditionally creates node chains for each texture channel.
-    Only channels with a provided file path (checkbox enabled) are processed.
+    Creates a Redshift Standard Material and conditionally creates node chains for each channel.
+    Expects file_paths with keys:
+      "BaseColor", "Roughness", "Normal", "Displacement", "materialName", "folder", "importObject"
+    Only channels with a provided file path will be processed.
     """
     doc = c4d.documents.GetActiveDocument()
     if not doc:
         return None
 
-    # Create a Redshift Standard Material using the preset command.
+    # Create the Redshift Standard Material using the preset command.
     c4d.CallCommand(1040254, 1012)
     mat = doc.GetActiveMaterial()
     if not mat:
         return None
-    material_name = file_paths.get("materialName", "New_Redshift_Material")
-    mat.SetName(material_name)
+    mat.SetName(file_paths.get("materialName", "New_Redshift_Material"))
 
     node_material = mat.GetNodeMaterialReference()
     if node_material is None:
@@ -74,12 +79,8 @@ def create_redshift_material(file_paths):
     # Retrieve the Standard Material node.
     standard_material_node = None
     result = []
-    maxon.GraphModelHelper.FindNodesByAssetId(
-        graph, 
-        maxon.Id("com.redshift3d.redshift4c4d.nodes.core.standardmaterial"), 
-        True, 
-        result
-    )
+    maxon.GraphModelHelper.FindNodesByAssetId(graph,
+        maxon.Id("com.redshift3d.redshift4c4d.nodes.core.standardmaterial"), True, result)
     if result:
         standard_material_node = result[0]
     else:
@@ -88,69 +89,64 @@ def create_redshift_material(file_paths):
     # Retrieve the Output node.
     output_node = None
     output_result = []
-    maxon.GraphModelHelper.FindNodesByAssetId(
-        graph,
-        maxon.Id("com.redshift3d.redshift4c4d.node.output"),
-        True,
-        output_result
-    )
+    maxon.GraphModelHelper.FindNodesByAssetId(graph,
+        maxon.Id("com.redshift3d.redshift4c4d.node.output"), True, output_result)
     if output_result:
         output_node = output_result[0]
     else:
         return None
 
-    # Node IDs for the different types of nodes.
+    # Node IDs.
     texture_sampler_id = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.texturesampler")
     color_correct_id   = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.rscolorcorrection")
     bump_map_id        = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.bumpmap")
     displacement_id    = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.displacement")
     ramp_id            = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.rsramp")
 
-    # Begin a single transaction for all modifications.
     with graph.BeginTransaction() as transaction:
         try:
             # --- BaseColor Chain ---
             if file_paths.get("BaseColor"):
                 base_tex = graph.AddChild("", texture_sampler_id, maxon.DataDictionary())
-                if not base_tex.IsNullValue():
+                if base_tex and not base_tex.IsNullValue():
                     tex0 = base_tex.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.texturesampler.tex0")
                     if tex0:
                         path_port = tex0.FindChild("path")
                         if path_port:
                             path_port.SetDefaultValue(maxon.Url(file_paths["BaseColor"]))
-                    color_correct_node = graph.AddChild("", color_correct_id, maxon.DataDictionary())
-                    if not color_correct_node.IsNullValue():
+                    cc_node = graph.AddChild("", color_correct_id, maxon.DataDictionary())
+                    if cc_node and not cc_node.IsNullValue():
                         out_color = base_tex.GetOutputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.texturesampler.outcolor")
-                        cc_input = color_correct_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.rscolorcorrection.input")
+                        cc_input = cc_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.rscolorcorrection.input")
                         if out_color and cc_input:
                             out_color.Connect(cc_input)
-                        cc_output = color_correct_node.GetOutputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.rscolorcorrection.outcolor")
+                        cc_output = cc_node.GetOutputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.rscolorcorrection.outcolor")
                         base_color_input = standard_material_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.standardmaterial.base_color")
                         if cc_output and base_color_input:
                             cc_output.Connect(base_color_input)
             # --- Roughness Chain ---
             if file_paths.get("Roughness"):
                 rough_tex = graph.AddChild("", texture_sampler_id, maxon.DataDictionary())
-                if not rough_tex.IsNullValue():
+                if rough_tex and not rough_tex.IsNullValue():
                     tex0 = rough_tex.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.texturesampler.tex0")
                     if tex0:
                         path_port = tex0.FindChild("path")
                         if path_port:
                             path_port.SetDefaultValue(maxon.Url(file_paths["Roughness"]))
-                    ramp_node = graph.AddChild("", ramp_id, maxon.DataDictionary())
-                    if not ramp_node.IsNullValue():
+                    ramp_node_inst = graph.AddChild("", ramp_id, maxon.DataDictionary())
+                    if ramp_node_inst and not ramp_node_inst.IsNullValue():
                         out_color = rough_tex.GetOutputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.texturesampler.outcolor")
-                        ramp_input = ramp_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.rsramp.input")
+                        ramp_input = ramp_node_inst.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.rsramp.input")
                         if out_color and ramp_input:
                             out_color.Connect(ramp_input)
-                        ramp_output = ramp_node.GetOutputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.rsramp.outcolor")
+                        ramp_output = ramp_node_inst.GetOutputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.rsramp.outcolor")
                         refl_input = standard_material_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.standardmaterial.refl_roughness")
                         if ramp_output and refl_input:
                             ramp_output.Connect(refl_input)
             # --- Normal Chain ---
             if file_paths.get("Normal"):
                 normal_tex = graph.AddChild("", texture_sampler_id, maxon.DataDictionary())
-                if not normal_tex.IsNullValue():
+                if normal_tex and not normal_tex.IsNullValue():
                     tex0 = normal_tex.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.texturesampler.tex0")
                     if tex0:
                         colorspace = tex0.FindChild("colorspace")
@@ -160,7 +156,7 @@ def create_redshift_material(file_paths):
                         if path_port:
                             path_port.SetDefaultValue(maxon.Url(file_paths["Normal"]))
                     bump_node = graph.AddChild("", bump_map_id, maxon.DataDictionary())
-                    if not bump_node.IsNullValue():
+                    if bump_node and not bump_node.IsNullValue():
                         input_map_type = bump_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.bumpmap.inputtype")
                         if input_map_type:
                             input_map_type.SetDefaultValue(maxon.Int32(1))
@@ -175,7 +171,7 @@ def create_redshift_material(file_paths):
             # --- Displacement Chain ---
             if file_paths.get("Displacement"):
                 disp_tex = graph.AddChild("", texture_sampler_id, maxon.DataDictionary())
-                if not disp_tex.IsNullValue():
+                if disp_tex and not disp_tex.IsNullValue():
                     tex0 = disp_tex.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.texturesampler.tex0")
                     if tex0:
                         colorspace = tex0.FindChild("colorspace")
@@ -185,7 +181,7 @@ def create_redshift_material(file_paths):
                         if path_port:
                             path_port.SetDefaultValue(maxon.Url(file_paths["Displacement"]))
                     disp_node = graph.AddChild("", displacement_id, maxon.DataDictionary())
-                    if not disp_node.IsNullValue():
+                    if disp_node and not disp_node.IsNullValue():
                         out_color = disp_tex.GetOutputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.texturesampler.outcolor")
                         disp_input = disp_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.displacement.texmap")
                         if out_color and disp_input:
@@ -257,7 +253,7 @@ class MyDialog(gui.GeDialog):
             "Displacement": "Displacement"
         }
         for name, checkbox_id in self.CHECKBOX_IDS.items():
-            is_checked = True  # All textures enabled by default.
+            is_checked = True  # All channels enabled by default.
             self.SetBool(checkbox_id, is_checked)
             self.SetString(self.TEXTBOX_IDS[name], default_texts[name])
             self.Enable(self.TEXTBOX_IDS[name], not is_checked)
@@ -279,29 +275,67 @@ class MyDialog(gui.GeDialog):
             if not selected_folder or not os.path.exists(selected_folder):
                 gui.MessageDialog("Please select a valid folder.")
                 return True
-            found_files = {}
-            for texture in ["BaseColor", "Roughness", "Normal", "Displacement"]:
-                checkbox_id = self.CHECKBOX_IDS[texture]
-                if self.GetBool(checkbox_id):
-                    search_text = self.GetString(self.TEXTBOX_IDS[texture]).strip()
-                    found_file = None
-                    for file_name in os.listdir(selected_folder):
-                        if search_text.lower() in file_name.lower():
-                            found_file = os.path.join(selected_folder, file_name)
-                            break
-                    found_files[texture] = found_file
+
+            channels = ["BaseColor", "Roughness", "Normal", "Displacement"]
+            # For each enabled channel, collect a dictionary mapping an identifier to a file path.
+            channel_files = { ch: {} for ch in channels }
+            for file_name in os.listdir(selected_folder):
+                for ch in channels:
+                    if self.GetBool(self.CHECKBOX_IDS[ch]):
+                        search_text = self.GetString(self.TEXTBOX_IDS[ch]).strip().lower().replace("_", "")
+                        file_name_clean = file_name.lower().replace("_", "")
+                        if search_text in file_name_clean:
+                            ident = get_texture_identifier(file_name, ch)
+                            if ident is not None:
+                                if ident not in channel_files[ch]:
+                                    channel_files[ch][ident] = os.path.join(selected_folder, file_name)
+            # Compute the intersection of identifiers across all enabled channels.
+            common_ids = None
+            for ch in channels:
+                if self.GetBool(self.CHECKBOX_IDS[ch]):
+                    ids = set(channel_files[ch].keys())
+                    if common_ids is None:
+                        common_ids = ids
+                    else:
+                        common_ids = common_ids.intersection(ids)
+            if common_ids is None or len(common_ids) == 0:
+                gui.MessageDialog("No complete texture set found for all channels.")
+                return True
+
+            # Build a dictionary of material sets.
+            materialSets = {}
+            base_material_name = self.GetString(self.MATERIAL_NAME_INPUT).strip()
+            for ident in common_ids:
+                ms = {}
+                for ch in channels:
+                    if self.GetBool(self.CHECKBOX_IDS[ch]):
+                        ms[ch] = channel_files[ch][ident]
+                    else:
+                        ms[ch] = None
+                if ident:
+                    ms["materialName"] = base_material_name + "_" + ident
                 else:
-                    found_files[texture] = None
-            found_files["materialName"] = self.GetString(self.MATERIAL_NAME_INPUT).strip()
-            found_files["folder"] = self.GetString(self.FOLDER_INPUT).strip()
+                    ms["materialName"] = base_material_name
+                materialSets[ident] = ms
+
+            found_files = {}
+            found_files["materialSets"] = materialSets
+            found_files["folder"] = selected_folder
             found_files["importObject"] = self.GetBool(self.IMPORT_3D_MODEL_CHECKBOX)
-            print("\n✅ Found File Paths:")
-            for key, value in found_files.items():
-                print(f"{key}: {value}")
+
+            print("\n✅ Found Material Sets:")
+            for ident, ms in materialSets.items():
+                print(f"Identifier '{ident}':")
+                for ch in channels:
+                    print(f"  {ch}: {ms.get(ch)}")
+                print(f"  Material Name: {ms.get('materialName')}")
             self.result = found_files
             self.Close()
         return True
 
+# --------------------------------------------------
+# Main Entry Point
+# --------------------------------------------------
 def main():
     dlg = MyDialog()
     dlg.Open(dlgtype=c4d.DLG_TYPE_MODAL, defaultw=400, defaulth=300)
@@ -309,9 +343,18 @@ def main():
     if file_paths is None:
         return  # User closed the dialog without clicking Create Material
     doc = c4d.documents.GetActiveDocument()
-    material = create_redshift_material(file_paths)
+
+    materialSets = file_paths.get("materialSets", {})
+    created_materials = {}
+    # Create a material for each complete texture set.
+    for ident, ms in materialSets.items():
+        mat = create_redshift_material(ms)
+        if mat:
+            created_materials[ident] = mat
+
+    # If 3D object import is enabled, merge objects (but do not assign materials).
     if file_paths.get("importObject") and file_paths.get("folder"):
-        folder = file_paths.get("folder")
+        folder = file_paths["folder"]
         old_objects = []
         first_obj = doc.GetFirstObject()
         if first_obj:
@@ -324,13 +367,8 @@ def main():
             for fpath in object_files:
                 c4d.documents.MergeDocument(doc, fpath, c4d.SCENEFILTER_OBJECTS)
             c4d.EventAdd()
-            new_objects = []
-            first_obj = doc.GetFirstObject()
-            if first_obj:
-                new_objects = get_all_objects(first_obj)
-            new_imported = [obj for obj in new_objects if obj not in old_objects]
-            for obj in new_imported:
-                assign_material_recursive(obj, material)
+            # Import objects are merged; materials are not automatically assigned.
+            # (Projection type on texture tags is already set when the material is created.)
             c4d.EventAdd()
 
 if __name__ == "__main__":
