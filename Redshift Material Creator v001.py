@@ -1,19 +1,3 @@
-"""
-Material Creator v001
-Developed by isintan kursun with the assistance of ChatGPT.
-This script scans a selected folder for texture files for each channel 
-(BaseColor, Roughness, Normal, Displacement) using case‐ and underscore‐insensitive matching.
-For each enabled channel the script uses the custom search text (which can contain comma‐separated keywords)
-to look for files whose names contain one of those keywords. It then extracts an identifier from each file—
-returning the substring after the keyword if available, otherwise the substring before.
-After collecting matches for each channel, if a channel returns only one match, its identifier is forced to "" 
-so that it groups with the others. Then, a material is created for each identifier found 
-(with the material name suffixed by the identifier if non‐empty). If an enabled channel has no matching file,
-that channel is omitted and the material is built without that texture.
-If the "Import 3D Model" option is enabled, the script merges the 3D objects from the folder without assigning any material.
-If you close the dialog without clicking "Create Material", no material is created.
-"""
-
 import c4d
 import maxon
 import os
@@ -24,12 +8,6 @@ from c4d import gui, storage
 # Helper: Extract identifier from filename using a given keyword
 # --------------------------------------------------
 def extract_identifier(file_name, keyword):
-    """
-    Given a file name and a keyword (from the custom search text),
-    remove the extension and underscores, convert to lowercase, and then find the keyword within it.
-    If found, return the substring that comes after the keyword if non‐empty; otherwise, return the substring before.
-    If the keyword is not found, return None.
-    """
     base = os.path.splitext(file_name)[0]
     cleaned = base.replace("_", "").lower()
     keyword_clean = keyword.lower().replace("_", "")
@@ -45,7 +23,6 @@ def extract_identifier(file_name, keyword):
 # Helper functions for object processing
 # --------------------------------------------------
 def get_all_objects(obj):
-    """Recursively returns a list of all objects in the hierarchy starting at obj."""
     result = []
     while obj:
         result.append(obj)
@@ -53,18 +30,10 @@ def get_all_objects(obj):
         obj = obj.GetNext()
     return result
 
-# (Material assignment to objects is not performed in this version.)
-
 # --------------------------------------------------
 # Material Creation Function (Conditional Node Creation)
 # --------------------------------------------------
 def create_redshift_material(file_paths):
-    """
-    Creates a Redshift Standard Material and conditionally creates node chains for each enabled channel.
-    Expects file_paths with keys:
-      "BaseColor", "Roughness", "Normal", "Displacement", "materialName", "folder", "importObject"
-    Only channels with a provided file path (non-None) are processed.
-    """
     doc = c4d.documents.GetActiveDocument()
     if not doc:
         return None
@@ -136,7 +105,7 @@ def create_redshift_material(file_paths):
                 else:
                     texture_nodes[ch] = None
 
-            # Create additional nodes only for channels that have a texture.
+            # Process BaseColor channel with AO option.
             if texture_nodes.get("BaseColor"):
                 cc_node = graph.AddChild("", color_correct_id, maxon.DataDictionary())
                 if cc_node and not cc_node.IsNullValue():
@@ -145,9 +114,22 @@ def create_redshift_material(file_paths):
                     if out_color and cc_input:
                         out_color.Connect(cc_input)
                     cc_output = cc_node.GetOutputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.rscolorcorrection.outcolor")
-                    base_color_input = standard_material_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.standardmaterial.base_color")
-                    if cc_output and base_color_input:
-                        cc_output.Connect(base_color_input)
+                    if cc_output:
+                        if file_paths.get("ao"):
+                            # Create AO node if AO checkbox is enabled.
+                            ao_node = graph.AddChild("", maxon.Id("com.redshift3d.redshift4c4d.nodes.core.ambientocclusion"), maxon.DataDictionary())
+                            if ao_node and not ao_node.IsNullValue():
+                                ao_bright_input = ao_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.ambientocclusion.bright")
+                                if ao_bright_input:
+                                    cc_output.Connect(ao_bright_input)
+                                ao_output = ao_node.GetOutputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.ambientocclusion.out")
+                                base_color_input = standard_material_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.standardmaterial.base_color")
+                                if ao_output and base_color_input:
+                                    ao_output.Connect(base_color_input)
+                        else:
+                            base_color_input = standard_material_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.standardmaterial.base_color")
+                            if cc_output and base_color_input:
+                                cc_output.Connect(base_color_input)
             if texture_nodes.get("Roughness"):
                 ramp_node_inst = graph.AddChild("", ramp_id, maxon.DataDictionary())
                 if ramp_node_inst and not ramp_node_inst.IsNullValue():
@@ -198,7 +180,8 @@ class MyDialog(gui.GeDialog):
     MATERIAL_NAME_INPUT = 1005
     FOLDER_INPUT = 1002
     SELECT_FOLDER_BUTTON = 1003
-    IMPORT_3D_MODEL_CHECKBOX = 4001  # Import 3D Model checkbox
+    IMPORT_3D_MODEL_CHECKBOX = 4001  # Existing Import 3D Model checkbox
+    AO_CHECKBOX = 4002               # New AO checkbox
     CREATE_MATERIAL_BUTTON = 1001
 
     CHECKBOX_IDS = {
@@ -229,11 +212,11 @@ class MyDialog(gui.GeDialog):
         for ch in channels:
             self.GroupBegin(6000 + self.CHECKBOX_IDS[ch], c4d.BFH_SCALEFIT, 2, 1)
             self.AddCheckbox(self.CHECKBOX_IDS[ch], c4d.BFH_LEFT, 20, 15, ch)
-            # Always keep the textbox enabled.
             self.AddEditText(self.TEXTBOX_IDS[ch], c4d.BFH_SCALEFIT, 300, 15)
             self.GroupEnd()
         self.GroupEnd()
         self.AddCheckbox(self.IMPORT_3D_MODEL_CHECKBOX, c4d.BFH_LEFT, 140, 15, "Import 3D Model")
+        self.AddCheckbox(self.AO_CHECKBOX, c4d.BFH_LEFT, 140, 15, "AO")  # AO checkbox added here
         self.AddButton(self.CREATE_MATERIAL_BUTTON, c4d.BFH_CENTER, 120, 15, "Create Material")
         return True
 
@@ -241,17 +224,18 @@ class MyDialog(gui.GeDialog):
         self.SetString(self.FOLDER_INPUT, "")
         self.SetString(self.MATERIAL_NAME_INPUT, "New_Redshift_Material")
         default_texts = {
-            "BaseColor": "BaseColor, Albedo",  # You can set default comma-separated keywords if desired.
+            "BaseColor": "BaseColor, Albedo",
             "Roughness": "Roughness, Rough",
             "Normal": "Normal, Nrm",
             "Displacement": "Displacement, Disp"
         }
         for ch, checkbox_id in self.CHECKBOX_IDS.items():
-            is_checked = True  # All channels enabled by default.
+            is_checked = True
             self.SetBool(checkbox_id, is_checked)
             self.SetString(self.TEXTBOX_IDS[ch], default_texts[ch])
-            self.Enable(self.TEXTBOX_IDS[ch], True)  # Always enabled.
+            self.Enable(self.TEXTBOX_IDS[ch], True)
         self.SetBool(self.IMPORT_3D_MODEL_CHECKBOX, False)
+        self.SetBool(self.AO_CHECKBOX, False)  # AO default unchecked
         self.result = None
         return True
 
@@ -260,7 +244,6 @@ class MyDialog(gui.GeDialog):
             folder_path = storage.LoadDialog(title="Select a Folder", flags=c4d.FILESELECT_DIRECTORY)
             if folder_path:
                 self.SetString(self.FOLDER_INPUT, folder_path)
-        # Do not change textbox enabling based on checkbox state.
         if id == self.CREATE_MATERIAL_BUTTON:
             selected_folder = self.GetString(self.FOLDER_INPUT).strip()
             if not selected_folder or not os.path.exists(selected_folder):
@@ -272,7 +255,6 @@ class MyDialog(gui.GeDialog):
             for file_name in os.listdir(selected_folder):
                 for ch in channels:
                     if self.GetBool(self.CHECKBOX_IDS[ch]):
-                        # Split the text field by commas to allow multiple keywords.
                         custom_text = self.GetString(self.TEXTBOX_IDS[ch]).strip()
                         keywords = [kw.strip() for kw in custom_text.split(',')]
                         file_name_clean = file_name.lower().replace("_", "")
@@ -284,13 +266,11 @@ class MyDialog(gui.GeDialog):
                                     ident = ""
                                 channel_files[ch][ident] = os.path.join(selected_folder, file_name)
                                 break
-            # Force channels with only one match to use empty identifier.
             for ch in channels:
                 if len(channel_files[ch]) == 1:
                     if channel_files[ch]:
                         val = next(iter(channel_files[ch].values()))
                         channel_files[ch] = {"": val}
-            # Grouping: use the union of identifiers across enabled channels.
             grouping_channels = [ch for ch in channels if self.GetBool(self.CHECKBOX_IDS[ch]) and len(channel_files[ch]) > 0]
             all_ids = set()
             for ch in grouping_channels:
@@ -313,19 +293,13 @@ class MyDialog(gui.GeDialog):
                     ms["materialName"] = base_material_name + "_" + ident
                 else:
                     ms["materialName"] = base_material_name
+                ms["ao"] = self.GetBool(self.AO_CHECKBOX)  # Pass AO flag to the material set
                 materialSets[ident] = ms
 
             found_files = {}
             found_files["materialSets"] = materialSets
             found_files["folder"] = selected_folder
             found_files["importObject"] = self.GetBool(self.IMPORT_3D_MODEL_CHECKBOX)
-
-            print("\n✅ Found Material Sets:")
-            for ident, ms in materialSets.items():
-                print(f"Identifier '{ident}':")
-                for ch in channels:
-                    print(f"  {ch}: {ms.get(ch)}")
-                print(f"  Material Name: {ms.get('materialName')}")
             self.result = found_files
             self.Close()
         return True
@@ -338,7 +312,7 @@ def main():
     dlg.Open(dlgtype=c4d.DLG_TYPE_MODAL, defaultw=400, defaulth=300)
     file_paths = dlg.result
     if file_paths is None:
-        return  # User closed the dialog without clicking Create Material
+        return
     doc = c4d.documents.GetActiveDocument()
 
     materialSets = file_paths.get("materialSets", {})
