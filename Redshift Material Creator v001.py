@@ -3,12 +3,14 @@ Material Creator v001
 Developed by isintan kursun with the assistance of ChatGPT.
 This script scans a selected folder for texture files for each channel 
 (BaseColor, Roughness, Normal, Displacement) using case‑ and underscore‑insensitive matching.
-For each enabled channel the script looks for files whose names contain the search text (which can be customized)
-and then extracts a common identifier by removing underscores and the channel keyword (the custom search text) from the file name.
-For every identifier that appears in any of the enabled channels, a Redshift Standard Material is created 
-(with the material name suffixed by the identifier if non‑empty). If a channel is enabled but no file is found,
-that channel is simply omitted.
-If the "Import 3D Model" option is enabled, the script merges the 3D objects from the folder without assigning any material.
+For each enabled channel the script uses the custom search text (entered in the corresponding textbox)
+to find files whose names contain that keyword. It then extracts a common identifier from each file by taking 
+the portion of the filename (after removing underscores and lowercasing) before the search keyword.
+For every identifier that appears in the enabled channels, a Redshift Standard Material is created 
+(with the material name suffixed by the identifier if non‑empty). Channels for which no matching file is found 
+will be left out.
+If the "Import 3D Model" option is enabled, the script merges the 3D objects from the folder 
+without assigning any material.
 If you close the dialog without clicking "Create Material", no material is created.
 """
 
@@ -19,24 +21,22 @@ import re
 from c4d import gui, storage
 
 # --------------------------------------------------
-# Helper: Extract identifier from filename using a given keyword
+# Helper: Extract identifier from filename using a keyword
 # --------------------------------------------------
-def get_texture_identifier(file_name, keyword):
+def extract_identifier(file_name, keyword):
     """
-    Given a file name and a keyword (from the custom search text, e.g. "basiccolor"),
-    remove the extension and underscores and check if the resulting name ends with the keyword
-    optionally followed by digits.
-    If yes, return the remaining prefix (the identifier) plus any trailing digits; otherwise return None.
+    Given a file name and a keyword (from the custom search text),
+    remove the extension and underscores and convert to lowercase.
+    If the keyword appears anywhere in the file name, return the substring before the keyword.
+    (If the keyword is at the beginning, an empty string is returned.)
+    If the keyword is not found, return None.
     """
     base = os.path.splitext(file_name)[0]
-    base_clean = base.replace("_", "").lower()
-    keyword_clean = keyword.replace("_", "").lower()
-    pattern = re.compile(r'^(.*)' + re.escape(keyword_clean) + r'(\d*)$')
-    match = pattern.match(base_clean)
-    if match:
-        ident = match.group(1)
-        digits = match.group(2)
-        return (ident + digits).strip()
+    file_norm = base.lower().replace("_", "")
+    keyword_norm = keyword.lower().replace("_", "")
+    idx = file_norm.find(keyword_norm)
+    if idx != -1:
+        return file_norm[:idx]  # Identifier is what comes before the keyword.
     return None
 
 # --------------------------------------------------
@@ -134,7 +134,7 @@ def create_redshift_material(file_paths):
                 else:
                     texture_nodes[ch] = None
 
-            # Create additional nodes only if their corresponding texture exists.
+            # Create additional nodes only if the corresponding texture exists.
             if texture_nodes.get("BaseColor"):
                 cc_node = graph.AddChild("", color_correct_id, maxon.DataDictionary())
                 if cc_node and not cc_node.IsNullValue():
@@ -196,7 +196,7 @@ class MyDialog(gui.GeDialog):
     MATERIAL_NAME_INPUT = 1005
     FOLDER_INPUT = 1002
     SELECT_FOLDER_BUTTON = 1003
-    IMPORT_3D_MODEL_CHECKBOX = 4001  # Import 3D Model checkbox
+    IMPORT_3D_MODEL_CHECKBOX = 4001
     CREATE_MATERIAL_BUTTON = 1001
 
     CHECKBOX_IDS = {
@@ -244,7 +244,7 @@ class MyDialog(gui.GeDialog):
             "Displacement": "Displacement"
         }
         for ch, checkbox_id in self.CHECKBOX_IDS.items():
-            is_checked = True  # All channels enabled by default.
+            is_checked = True
             self.SetBool(checkbox_id, is_checked)
             self.SetString(self.TEXTBOX_IDS[ch], default_texts[ch])
             self.Enable(self.TEXTBOX_IDS[ch], not is_checked)
@@ -268,17 +268,17 @@ class MyDialog(gui.GeDialog):
                 return True
 
             channels = ["BaseColor", "Roughness", "Normal", "Displacement"]
-            # For each enabled channel, collect a dictionary mapping an identifier to a file path.
             channel_files = { ch: {} for ch in channels }
             for file_name in os.listdir(selected_folder):
                 for ch in channels:
                     if self.GetBool(self.CHECKBOX_IDS[ch]):
-                        # Use the custom text from the text field as the channel keyword.
-                        custom_keyword = self.GetString(self.TEXTBOX_IDS[ch]).strip().lower().replace("_", "")
+                        custom_keyword = self.GetString(self.TEXTBOX_IDS[ch]).strip()
+                        keyword = custom_keyword.lower().replace("_", "")
                         file_name_clean = file_name.lower().replace("_", "")
-                        if custom_keyword in file_name_clean:
-                            ident = get_texture_identifier(file_name, custom_keyword)
+                        if keyword in file_name_clean:
+                            ident = extract_identifier(file_name, custom_keyword)
                             if ident is not None:
+                                # If more than one file has the same identifier, the latter will override the former.
                                 channel_files[ch][ident] = os.path.join(selected_folder, file_name)
             # Grouping: use the union of identifiers across enabled channels.
             grouping_channels = [ch for ch in channels if self.GetBool(self.CHECKBOX_IDS[ch]) and len(channel_files[ch]) > 0]
