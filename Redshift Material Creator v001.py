@@ -2,15 +2,16 @@
 Material Creator v001
 Developed by isintan kursun with the assistance of ChatGPT.
 This script scans a selected folder for texture files for each channel 
-(BaseColor, Roughness, Normal, Displacement) using case‑ and underscore‑insensitive matching.
+(BaseColor, Roughness, Normal, Displacement) using case‐ and underscore‐insensitive matching.
 For each enabled channel the script uses the custom search text (entered in the corresponding textbox)
-to find files whose names contain that keyword. It then extracts a common identifier from each file by taking 
-the portion of the filename (after removing underscores and lowercasing) before the search keyword.
-For every identifier that appears in the enabled channels, a Redshift Standard Material is created 
-(with the material name suffixed by the identifier if non‑empty). Channels for which no matching file is found 
-will be left out.
-If the "Import 3D Model" option is enabled, the script merges the 3D objects from the folder 
-without assigning any material.
+to look for files whose names contain that keyword and then extracts an identifier from each file by taking
+the portion of the filename (after removing underscores and lowercasing) that comes before the keyword.
+After collecting matches for each channel, if a channel has only one match, its key is forced to a common value (""), 
+so that if all channels have a single file, they are grouped into one complete texture set.
+For every identifier (or the common identifier "") found in any of the enabled channels, a Redshift Standard Material is created 
+(with the material name suffixed by the identifier if non‐empty). If a channel is enabled but no matching file is found,
+that channel is simply omitted and the material is built without that texture.
+If the "Import 3D Model" option is enabled, the script merges the 3D objects from the folder without assigning any material.
 If you close the dialog without clicking "Create Material", no material is created.
 """
 
@@ -21,22 +22,21 @@ import re
 from c4d import gui, storage
 
 # --------------------------------------------------
-# Helper: Extract identifier from filename using a keyword
+# Helper: Extract identifier from filename using a given keyword
 # --------------------------------------------------
 def extract_identifier(file_name, keyword):
     """
-    Given a file name and a keyword (from the custom search text),
-    remove the extension and underscores and convert to lowercase.
-    If the keyword appears anywhere in the file name, return the substring before the keyword.
-    (If the keyword is at the beginning, an empty string is returned.)
-    If the keyword is not found, return None.
+    Given a file name and a keyword (from the custom search text), remove the extension and underscores,
+    convert to lowercase, and then find the keyword within it.
+    If found, return the substring that comes before the keyword (this will be used as the identifier);
+    otherwise return None.
     """
     base = os.path.splitext(file_name)[0]
-    file_norm = base.lower().replace("_", "")
+    file_norm = base.replace("_", "").lower()
     keyword_norm = keyword.lower().replace("_", "")
     idx = file_norm.find(keyword_norm)
     if idx != -1:
-        return file_norm[:idx]  # Identifier is what comes before the keyword.
+        return file_norm[:idx].strip()  # Identifier is what comes before the keyword.
     return None
 
 # --------------------------------------------------
@@ -104,7 +104,7 @@ def create_redshift_material(file_paths):
     else:
         return None
 
-    # Node IDs.
+    # Define node IDs.
     texture_sampler_id = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.texturesampler")
     color_correct_id   = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.rscolorcorrection")
     bump_map_id        = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.bumpmap")
@@ -134,7 +134,7 @@ def create_redshift_material(file_paths):
                 else:
                     texture_nodes[ch] = None
 
-            # Create additional nodes only if the corresponding texture exists.
+            # Create additional nodes only for channels that have a texture.
             if texture_nodes.get("BaseColor"):
                 cc_node = graph.AddChild("", color_correct_id, maxon.DataDictionary())
                 if cc_node and not cc_node.IsNullValue():
@@ -196,7 +196,7 @@ class MyDialog(gui.GeDialog):
     MATERIAL_NAME_INPUT = 1005
     FOLDER_INPUT = 1002
     SELECT_FOLDER_BUTTON = 1003
-    IMPORT_3D_MODEL_CHECKBOX = 4001
+    IMPORT_3D_MODEL_CHECKBOX = 4001  # Import 3D Model checkbox
     CREATE_MATERIAL_BUTTON = 1001
 
     CHECKBOX_IDS = {
@@ -272,14 +272,22 @@ class MyDialog(gui.GeDialog):
             for file_name in os.listdir(selected_folder):
                 for ch in channels:
                     if self.GetBool(self.CHECKBOX_IDS[ch]):
+                        # Use the custom text entered in the textbox as the search keyword.
                         custom_keyword = self.GetString(self.TEXTBOX_IDS[ch]).strip()
                         keyword = custom_keyword.lower().replace("_", "")
                         file_name_clean = file_name.lower().replace("_", "")
                         if keyword in file_name_clean:
                             ident = extract_identifier(file_name, custom_keyword)
-                            if ident is not None:
-                                # If more than one file has the same identifier, the latter will override the former.
-                                channel_files[ch][ident] = os.path.join(selected_folder, file_name)
+                            if ident is None:
+                                # If no identifier could be extracted, use an empty string.
+                                ident = ""
+                            channel_files[ch][ident] = os.path.join(selected_folder, file_name)
+            # If a channel has only one match, force its identifier to "" so it groups with others.
+            for ch in channels:
+                if len(channel_files[ch]) == 1:
+                    if channel_files[ch]:
+                        value = next(iter(channel_files[ch].values()))
+                        channel_files[ch] = {"": value}
             # Grouping: use the union of identifiers across enabled channels.
             grouping_channels = [ch for ch in channels if self.GetBool(self.CHECKBOX_IDS[ch]) and len(channel_files[ch]) > 0]
             all_ids = set()
