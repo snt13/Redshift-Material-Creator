@@ -3,13 +3,13 @@ Material Creator v001
 Developed by isintan kursun with the assistance of ChatGPT.
 This script scans a selected folder for texture files for each channel 
 (BaseColor, Roughness, Normal, Displacement) using case‐ and underscore‐insensitive matching.
-For each enabled channel the script uses the custom search text (entered in the corresponding textbox)
-to look for files whose names contain that keyword and then extracts an identifier from each file.
-The extraction function returns the substring after the keyword if available; otherwise, it returns the substring before.
+For each enabled channel the script uses the custom search text (which can contain comma‐separated keywords)
+to look for files whose names contain one of those keywords. It then extracts an identifier from each file—
+returning the substring after the keyword if available, otherwise the substring before.
 After collecting matches for each channel, if a channel returns only one match, its identifier is forced to "" 
 so that it groups with the others. Then, a material is created for each identifier found 
-(with the material name suffixed by the identifier if non‐empty). If a channel is enabled but no matching file is found,
-that channel is omitted and the material is created without that texture.
+(with the material name suffixed by the identifier if non‐empty). If an enabled channel has no matching file,
+that channel is omitted and the material is built without that texture.
 If the "Import 3D Model" option is enabled, the script merges the 3D objects from the folder without assigning any material.
 If you close the dialog without clicking "Create Material", no material is created.
 """
@@ -26,10 +26,8 @@ from c4d import gui, storage
 def extract_identifier(file_name, keyword):
     """
     Given a file name and a keyword (from the custom search text),
-    remove the extension and underscores, convert to lowercase,
-    and then find the keyword within it.
-    If found, return the substring that comes after the keyword if non‐empty;
-    otherwise, return the substring before the keyword.
+    remove the extension and underscores, convert to lowercase, and then find the keyword within it.
+    If found, return the substring that comes after the keyword if non‐empty; otherwise, return the substring before.
     If the keyword is not found, return None.
     """
     base = os.path.splitext(file_name)[0]
@@ -231,7 +229,7 @@ class MyDialog(gui.GeDialog):
         for ch in channels:
             self.GroupBegin(6000 + self.CHECKBOX_IDS[ch], c4d.BFH_SCALEFIT, 2, 1)
             self.AddCheckbox(self.CHECKBOX_IDS[ch], c4d.BFH_LEFT, 20, 15, ch)
-            # Always leave textboxes enabled.
+            # Always keep the textbox enabled.
             self.AddEditText(self.TEXTBOX_IDS[ch], c4d.BFH_SCALEFIT, 300, 15)
             self.GroupEnd()
         self.GroupEnd()
@@ -243,17 +241,16 @@ class MyDialog(gui.GeDialog):
         self.SetString(self.FOLDER_INPUT, "")
         self.SetString(self.MATERIAL_NAME_INPUT, "New_Redshift_Material")
         default_texts = {
-            "BaseColor": "BaseColor",
-            "Roughness": "Roughness",
-            "Normal": "Normal",
-            "Displacement": "Displacement"
+            "BaseColor": "BaseColor, Albedo",  # You can set default comma-separated keywords if desired.
+            "Roughness": "Roughness, Rough",
+            "Normal": "Normal, Nrm",
+            "Displacement": "Displacement, Disp"
         }
         for ch, checkbox_id in self.CHECKBOX_IDS.items():
             is_checked = True  # All channels enabled by default.
             self.SetBool(checkbox_id, is_checked)
             self.SetString(self.TEXTBOX_IDS[ch], default_texts[ch])
-            # Do not disable textboxes; always allow editing.
-            self.Enable(self.TEXTBOX_IDS[ch], True)
+            self.Enable(self.TEXTBOX_IDS[ch], True)  # Always enabled.
         self.SetBool(self.IMPORT_3D_MODEL_CHECKBOX, False)
         self.result = None
         return True
@@ -275,14 +272,18 @@ class MyDialog(gui.GeDialog):
             for file_name in os.listdir(selected_folder):
                 for ch in channels:
                     if self.GetBool(self.CHECKBOX_IDS[ch]):
-                        custom_keyword = self.GetString(self.TEXTBOX_IDS[ch]).strip()
-                        keyword = custom_keyword.lower().replace("_", "")
+                        # Split the text field by commas to allow multiple keywords.
+                        custom_text = self.GetString(self.TEXTBOX_IDS[ch]).strip()
+                        keywords = [kw.strip() for kw in custom_text.split(',')]
                         file_name_clean = file_name.lower().replace("_", "")
-                        if keyword in file_name_clean:
-                            ident = extract_identifier(file_name, custom_keyword)
-                            if ident is None:
-                                ident = ""
-                            channel_files[ch][ident] = os.path.join(selected_folder, file_name)
+                        for kw in keywords:
+                            kw_clean = kw.lower().replace("_", "")
+                            if kw_clean in file_name_clean:
+                                ident = extract_identifier(file_name, kw)
+                                if ident is None:
+                                    ident = ""
+                                channel_files[ch][ident] = os.path.join(selected_folder, file_name)
+                                break
             # Force channels with only one match to use empty identifier.
             for ch in channels:
                 if len(channel_files[ch]) == 1:
