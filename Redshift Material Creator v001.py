@@ -4,13 +4,12 @@ Developed by isintan kursun with the assistance of ChatGPT.
 This script scans a selected folder for texture files for each channel 
 (BaseColor, Roughness, Normal, Displacement) using case‐ and underscore‐insensitive matching.
 For each enabled channel the script uses the custom search text (entered in the corresponding textbox)
-to look for files whose names contain that keyword and then extracts an identifier from each file by taking
-the portion of the filename (after removing underscores and lowercasing) that comes before the keyword.
-After collecting matches for each channel, if a channel has only one match, its key is forced to a common value (""), 
-so that if all channels have a single file, they are grouped into one complete texture set.
-For every identifier (or the common identifier "") found in any of the enabled channels, a Redshift Standard Material is created 
+to look for files whose names contain that keyword and then extracts an identifier from each file.
+The extraction function returns the substring after the keyword if available; otherwise, it returns the substring before.
+After collecting matches for each channel, if a channel returns only one match, its identifier is forced to "" 
+so that it groups with the others. Then, a material is created for each identifier found 
 (with the material name suffixed by the identifier if non‐empty). If a channel is enabled but no matching file is found,
-that channel is simply omitted and the material is built without that texture.
+that channel is omitted and the material is created without that texture.
 If the "Import 3D Model" option is enabled, the script merges the 3D objects from the folder without assigning any material.
 If you close the dialog without clicking "Create Material", no material is created.
 """
@@ -26,17 +25,22 @@ from c4d import gui, storage
 # --------------------------------------------------
 def extract_identifier(file_name, keyword):
     """
-    Given a file name and a keyword (from the custom search text), remove the extension and underscores,
-    convert to lowercase, and then find the keyword within it.
-    If found, return the substring that comes before the keyword (this will be used as the identifier);
-    otherwise return None.
+    Given a file name and a keyword (from the custom search text),
+    remove the extension and underscores, convert to lowercase,
+    and then find the keyword within it.
+    If found, return the substring that comes after the keyword if non‐empty;
+    otherwise, return the substring before the keyword.
+    If the keyword is not found, return None.
     """
     base = os.path.splitext(file_name)[0]
-    file_norm = base.replace("_", "").lower()
-    keyword_norm = keyword.lower().replace("_", "")
-    idx = file_norm.find(keyword_norm)
-    if idx != -1:
-        return file_norm[:idx].strip()  # Identifier is what comes before the keyword.
+    cleaned = base.replace("_", "").lower()
+    keyword_clean = keyword.lower().replace("_", "")
+    pattern = re.compile(r'^(.*)' + re.escape(keyword_clean) + r'(.*)$')
+    match = pattern.match(cleaned)
+    if match:
+        before = match.group(1).strip()
+        after = match.group(2).strip()
+        return after if after else before
     return None
 
 # --------------------------------------------------
@@ -104,7 +108,7 @@ def create_redshift_material(file_paths):
     else:
         return None
 
-    # Define node IDs.
+    # Node IDs.
     texture_sampler_id = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.texturesampler")
     color_correct_id   = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.rscolorcorrection")
     bump_map_id        = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.bumpmap")
@@ -227,6 +231,7 @@ class MyDialog(gui.GeDialog):
         for ch in channels:
             self.GroupBegin(6000 + self.CHECKBOX_IDS[ch], c4d.BFH_SCALEFIT, 2, 1)
             self.AddCheckbox(self.CHECKBOX_IDS[ch], c4d.BFH_LEFT, 20, 15, ch)
+            # Always leave textboxes enabled.
             self.AddEditText(self.TEXTBOX_IDS[ch], c4d.BFH_SCALEFIT, 300, 15)
             self.GroupEnd()
         self.GroupEnd()
@@ -244,10 +249,11 @@ class MyDialog(gui.GeDialog):
             "Displacement": "Displacement"
         }
         for ch, checkbox_id in self.CHECKBOX_IDS.items():
-            is_checked = True
+            is_checked = True  # All channels enabled by default.
             self.SetBool(checkbox_id, is_checked)
             self.SetString(self.TEXTBOX_IDS[ch], default_texts[ch])
-            self.Enable(self.TEXTBOX_IDS[ch], not is_checked)
+            # Do not disable textboxes; always allow editing.
+            self.Enable(self.TEXTBOX_IDS[ch], True)
         self.SetBool(self.IMPORT_3D_MODEL_CHECKBOX, False)
         self.result = None
         return True
@@ -257,10 +263,7 @@ class MyDialog(gui.GeDialog):
             folder_path = storage.LoadDialog(title="Select a Folder", flags=c4d.FILESELECT_DIRECTORY)
             if folder_path:
                 self.SetString(self.FOLDER_INPUT, folder_path)
-        for ch, checkbox_id in self.CHECKBOX_IDS.items():
-            if id == checkbox_id:
-                is_checked = self.GetBool(checkbox_id)
-                self.Enable(self.TEXTBOX_IDS[ch], not is_checked)
+        # Do not change textbox enabling based on checkbox state.
         if id == self.CREATE_MATERIAL_BUTTON:
             selected_folder = self.GetString(self.FOLDER_INPUT).strip()
             if not selected_folder or not os.path.exists(selected_folder):
@@ -272,22 +275,20 @@ class MyDialog(gui.GeDialog):
             for file_name in os.listdir(selected_folder):
                 for ch in channels:
                     if self.GetBool(self.CHECKBOX_IDS[ch]):
-                        # Use the custom text entered in the textbox as the search keyword.
                         custom_keyword = self.GetString(self.TEXTBOX_IDS[ch]).strip()
                         keyword = custom_keyword.lower().replace("_", "")
                         file_name_clean = file_name.lower().replace("_", "")
                         if keyword in file_name_clean:
                             ident = extract_identifier(file_name, custom_keyword)
                             if ident is None:
-                                # If no identifier could be extracted, use an empty string.
                                 ident = ""
                             channel_files[ch][ident] = os.path.join(selected_folder, file_name)
-            # If a channel has only one match, force its identifier to "" so it groups with others.
+            # Force channels with only one match to use empty identifier.
             for ch in channels:
                 if len(channel_files[ch]) == 1:
                     if channel_files[ch]:
-                        value = next(iter(channel_files[ch].values()))
-                        channel_files[ch] = {"": value}
+                        val = next(iter(channel_files[ch].values()))
+                        channel_files[ch] = {"": val}
             # Grouping: use the union of identifiers across enabled channels.
             grouping_channels = [ch for ch in channels if self.GetBool(self.CHECKBOX_IDS[ch]) and len(channel_files[ch]) > 0]
             all_ids = set()
