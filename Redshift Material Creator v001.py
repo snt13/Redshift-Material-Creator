@@ -201,7 +201,7 @@ class MyDialog(gui.GeDialog):
     }
 
     def CreateLayout(self):
-        self.SetTitle("Material Creator v001")
+        self.SetTitle("Redshift Material Creator")
         
         # --- Material Name Row ---
         self.GroupBegin(9000, c4d.BFH_SCALEFIT, 2, 1)
