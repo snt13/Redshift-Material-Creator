@@ -1,37 +1,14 @@
-"""
-Material Creator v001
-Developed by isintan kursun with the assistance of ChatGPT.
-This script scans a selected folder for texture files for each channel 
-(BaseColor, Roughness, Normal, Displacement) using case‐ and underscore‐insensitive matching.
-For each enabled channel the script uses the custom search text (entered in the corresponding textbox)
-to look for files whose names contain one of the comma‐separated keywords, and then extracts an identifier from each file.
-If a channel returns only one match, its identifier is forced to "" so that it groups with the others.
-A Redshift Standard Material is then created for each identifier found (the material name is suffixed by the identifier if non‐empty).
-If the "Import 3D Model" option is enabled, the script merges the 3D objects from the folder without assigning any material.
-Additionally, if the AO checkbox is checked (ID 4002), an AO node is created and inserted into the BaseColor chain:
-  • The Color Correct node’s OutColor is connected to the AO node’s “bright” input.
-  • The AO node’s output is connected to the Standard Material’s base_color input.
-If you close the dialog without clicking "Create Material", no material is created.
-"""
-
 import c4d
 import maxon
 import os
 import re
+import shutil
 from c4d import gui, storage
 
 # --------------------------------------------------
 # Helper: Extract identifier from filename using a given keyword
 # --------------------------------------------------
 def extract_identifier(file_name, keyword):
-    """
-    Given a file name and a keyword (from the custom search text),
-    remove the extension and underscores, convert to lowercase, and then
-    find the keyword anywhere in the filename.
-    If found, return the substring that comes after the keyword if non‐empty;
-    otherwise return the substring before.
-    If the keyword is not found, return None.
-    """
     base = os.path.splitext(file_name)[0]
     cleaned = base.replace("_", "").lower()
     keyword_clean = keyword.lower().replace("_", "")
@@ -47,7 +24,6 @@ def extract_identifier(file_name, keyword):
 # Helper functions for object processing
 # --------------------------------------------------
 def get_all_objects(obj):
-    """Recursively returns a list of all objects in the hierarchy starting at obj."""
     result = []
     while obj:
         result.append(obj)
@@ -59,13 +35,6 @@ def get_all_objects(obj):
 # Material Creation Function (Conditional Node Creation)
 # --------------------------------------------------
 def create_redshift_material(file_paths):
-    """
-    Creates a Redshift Standard Material and conditionally creates node chains for each enabled channel.
-    Expects file_paths with keys:
-      "BaseColor", "Roughness", "Normal", "Displacement", "materialName", "folder", "importObject", "AO"
-    Only channels with a provided file path (non-None) are processed.
-    If AO is enabled (file_paths["AO"] is True), an AO node is inserted into the BaseColor chain.
-    """
     doc = c4d.documents.GetActiveDocument()
     if not doc:
         return None
@@ -107,14 +76,12 @@ def create_redshift_material(file_paths):
     else:
         return None
 
-    # Define node IDs.
+    # Node IDs.
     texture_sampler_id = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.texturesampler")
     color_correct_id   = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.rscolorcorrection")
     bump_map_id        = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.bumpmap")
     displacement_id    = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.displacement")
     ramp_id            = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.rsramp")
-    ao_node_id         = maxon.Id("com.redshift3d.redshift4c4d.nodes.core.ambientocclusion")
-    # Note: The AO node's asset ID is used here; the provided specific ID string is not required.
 
     with graph.BeginTransaction() as transaction:
         try:
@@ -127,6 +94,7 @@ def create_redshift_material(file_paths):
                         texture_nodes[ch] = tex_node
                         tex0_input = tex_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.texturesampler.tex0")
                         if tex0_input:
+                            # Set colorspace to RAW for Normal and Displacement
                             if ch in ["Normal", "Displacement"]:
                                 colorspace_port = tex0_input.FindChild("colorspace")
                                 if colorspace_port:
@@ -139,8 +107,7 @@ def create_redshift_material(file_paths):
                 else:
                     texture_nodes[ch] = None
 
-            # Build BaseColor chain.
-            cc_node = None
+            # Process BaseColor channel with AO option.
             if texture_nodes.get("BaseColor"):
                 cc_node = graph.AddChild("", color_correct_id, maxon.DataDictionary())
                 if cc_node and not cc_node.IsNullValue():
@@ -148,10 +115,23 @@ def create_redshift_material(file_paths):
                     cc_input = cc_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.rscolorcorrection.input")
                     if out_color and cc_input:
                         out_color.Connect(cc_input)
-                    # Instead of connecting directly to the standard material,
-                    # if AO is enabled we'll override that connection.
                     cc_output = cc_node.GetOutputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.rscolorcorrection.outcolor")
-            # Build Roughness chain.
+                    if cc_output:
+                        if file_paths.get("ao"):
+                            # Create AO node if AO checkbox is enabled.
+                            ao_node = graph.AddChild("", maxon.Id("com.redshift3d.redshift4c4d.nodes.core.ambientocclusion"), maxon.DataDictionary())
+                            if ao_node and not ao_node.IsNullValue():
+                                ao_bright_input = ao_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.ambientocclusion.bright")
+                                if ao_bright_input:
+                                    cc_output.Connect(ao_bright_input)
+                                ao_output = ao_node.GetOutputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.ambientocclusion.out")
+                                base_color_input = standard_material_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.standardmaterial.base_color")
+                                if ao_output and base_color_input:
+                                    ao_output.Connect(base_color_input)
+                        else:
+                            base_color_input = standard_material_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.standardmaterial.base_color")
+                            if cc_output and base_color_input:
+                                cc_output.Connect(base_color_input)
             if texture_nodes.get("Roughness"):
                 ramp_node_inst = graph.AddChild("", ramp_id, maxon.DataDictionary())
                 if ramp_node_inst and not ramp_node_inst.IsNullValue():
@@ -163,7 +143,6 @@ def create_redshift_material(file_paths):
                     refl_input = standard_material_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.standardmaterial.refl_roughness")
                     if ramp_output and refl_input:
                         ramp_output.Connect(refl_input)
-            # Build Normal chain.
             if texture_nodes.get("Normal"):
                 bump_node = graph.AddChild("", bump_map_id, maxon.DataDictionary())
                 if bump_node and not bump_node.IsNullValue():
@@ -178,7 +157,6 @@ def create_redshift_material(file_paths):
                     bump_std_input = standard_material_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.standardmaterial.bump_input")
                     if bump_output and bump_std_input:
                         bump_output.Connect(bump_std_input)
-            # Build Displacement chain.
             if texture_nodes.get("Displacement"):
                 disp_node = graph.AddChild("", displacement_id, maxon.DataDictionary())
                 if disp_node and not disp_node.IsNullValue():
@@ -190,27 +168,6 @@ def create_redshift_material(file_paths):
                     output_disp_input = output_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.node.output.displacement")
                     if disp_output and output_disp_input:
                         disp_output.Connect(output_disp_input)
-            # AO chain: If AO is enabled in the UI, create the AO node and override the BaseColor connection.
-            if file_paths.get("AO") and cc_node is not None:
-                ao_node = graph.AddChild("", ao_node_id, maxon.DataDictionary())
-                if not ao_node.IsNullValue():
-                    # Connect the Color Correct out to the AO node's bright input.
-                    cc_output = cc_node.GetOutputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.rscolorcorrection.outcolor")
-                    ao_input = ao_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.ambientocclusion.bright")
-                    if cc_output and ao_input:
-                        cc_output.Connect(ao_input)
-                    # Then connect the AO node's out to the Standard Material's base_color input.
-                    ao_output = ao_node.GetOutputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.ambientocclusion.out")
-                    base_color_input = standard_material_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.standardmaterial.base_color")
-                    if ao_output and base_color_input:
-                        ao_output.Connect(base_color_input)
-            else:
-                # If AO is not enabled, connect Color Correct output directly to base_color.
-                if cc_node is not None:
-                    cc_output = cc_node.GetOutputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.rscolorcorrection.outcolor")
-                    base_color_input = standard_material_node.GetInputs().FindChild("com.redshift3d.redshift4c4d.nodes.core.standardmaterial.base_color")
-                    if cc_output and base_color_input:
-                        cc_output.Connect(base_color_input)
             transaction.Commit()
         except Exception as e:
             transaction.Rollback()
@@ -225,16 +182,16 @@ class MyDialog(gui.GeDialog):
     MATERIAL_NAME_INPUT = 1005
     FOLDER_INPUT = 1002
     SELECT_FOLDER_BUTTON = 1003
-    IMPORT_3D_MODEL_CHECKBOX = 4001  # Import 3D Model checkbox
-    AO_CHECKBOX = 4002             # New AO checkbox
+    IMPORT_3D_MODEL_CHECKBOX = 4001  # Existing Import 3D Model checkbox
+    AO_CHECKBOX = 4002               # AO checkbox
+    COPY_TEXTURES_CHECKBOX = 4003    # New Copy Textures checkbox
     CREATE_MATERIAL_BUTTON = 1001
 
     CHECKBOX_IDS = {
         "BaseColor": 2001,
         "Roughness": 2003,
         "Normal": 2004,
-        "Displacement": 2005,
-        "AO": 4002
+        "Displacement": 2005
     }
     TEXTBOX_IDS = {
         "BaseColor": 3001,
@@ -245,14 +202,20 @@ class MyDialog(gui.GeDialog):
 
     def CreateLayout(self):
         self.SetTitle("Material Creator v001")
+        
+        # --- Material Name Row ---
         self.GroupBegin(9000, c4d.BFH_SCALEFIT, 2, 1)
         self.AddStaticText(9001, c4d.BFH_LEFT, name="Material Name:")
         self.AddEditText(self.MATERIAL_NAME_INPUT, c4d.BFH_SCALEFIT, 250, 15)
         self.GroupEnd()
+        
+        # --- Folder Selection Row ---
         self.GroupBegin(1000, c4d.BFH_SCALEFIT, 2, 1)
         self.AddEditText(self.FOLDER_INPUT, c4d.BFH_SCALEFIT, 300, 15)
         self.AddButton(self.SELECT_FOLDER_BUTTON, c4d.BFH_RIGHT, 100, 15, "Select Folder")
         self.GroupEnd()
+        
+        # --- Texture Channels ---
         channels = ["BaseColor", "Roughness", "Normal", "Displacement"]
         self.GroupBegin(5000, c4d.BFH_SCALEFIT, 1, len(channels) * 2)
         for ch in channels:
@@ -261,16 +224,23 @@ class MyDialog(gui.GeDialog):
             self.AddEditText(self.TEXTBOX_IDS[ch], c4d.BFH_SCALEFIT, 300, 15)
             self.GroupEnd()
         self.GroupEnd()
-        # Import 3D Model checkbox.
-        self.AddCheckbox(self.IMPORT_3D_MODEL_CHECKBOX, c4d.BFH_LEFT, 140, 15, "Import 3D Model")
-        # New AO checkbox.
-        self.AddCheckbox(self.AO_CHECKBOX, c4d.BFH_LEFT, 140, 15, "AO")
+        
+        # --- Additional Options in One Horizontal Row ---
+        self.GroupBegin(8000, c4d.BFH_LEFT, 3, 1)  # 3 columns, 1 row
+        # You can adjust the widths below to ensure text fits nicely:
+        self.AddCheckbox(self.IMPORT_3D_MODEL_CHECKBOX, c4d.BFH_LEFT, 165, 15, "Import 3D Model")
+        self.AddCheckbox(self.AO_CHECKBOX, c4d.BFH_LEFT, 55, 15, "AO")
+        self.AddCheckbox(self.COPY_TEXTURES_CHECKBOX, c4d.BFH_LEFT, 100, 15, "Copy Textures")
+        self.GroupEnd()
+        
+        # --- Create Material Button ---
         self.AddButton(self.CREATE_MATERIAL_BUTTON, c4d.BFH_CENTER, 120, 15, "Create Material")
         return True
 
     def InitValues(self):
         self.SetString(self.FOLDER_INPUT, "")
         self.SetString(self.MATERIAL_NAME_INPUT, "New_Redshift_Material")
+        
         default_texts = {
             "BaseColor": "BaseColor, Albedo",
             "Roughness": "Roughness, Rough",
@@ -278,16 +248,16 @@ class MyDialog(gui.GeDialog):
             "Displacement": "Displacement, Disp"
         }
         for ch, checkbox_id in self.CHECKBOX_IDS.items():
-            if ch == "AO":
-                # AO checkbox is unchecked by default.
-                self.SetBool(checkbox_id, False)
-            else:
-                self.SetBool(checkbox_id, True)
-        for ch, textbox_id in self.TEXTBOX_IDS.items():
-            self.SetString(textbox_id, default_texts[ch])
-            # Always keep textboxes enabled.
-            self.Enable(textbox_id, True)
+            is_checked = True
+            self.SetBool(checkbox_id, is_checked)
+            self.SetString(self.TEXTBOX_IDS[ch], default_texts[ch])
+            self.Enable(self.TEXTBOX_IDS[ch], True)
+        
+        # Default states for the bottom checkboxes
         self.SetBool(self.IMPORT_3D_MODEL_CHECKBOX, False)
+        self.SetBool(self.AO_CHECKBOX, False)
+        self.SetBool(self.COPY_TEXTURES_CHECKBOX, False)
+        
         self.result = None
         return True
 
@@ -296,7 +266,7 @@ class MyDialog(gui.GeDialog):
             folder_path = storage.LoadDialog(title="Select a Folder", flags=c4d.FILESELECT_DIRECTORY)
             if folder_path:
                 self.SetString(self.FOLDER_INPUT, folder_path)
-        # Do not disable text boxes regardless of checkbox state.
+        
         if id == self.CREATE_MATERIAL_BUTTON:
             selected_folder = self.GetString(self.FOLDER_INPUT).strip()
             if not selected_folder or not os.path.exists(selected_folder):
@@ -304,11 +274,12 @@ class MyDialog(gui.GeDialog):
                 return True
 
             channels = ["BaseColor", "Roughness", "Normal", "Displacement"]
-            channel_files = { ch: {} for ch in channels }
+            channel_files = {ch: {} for ch in channels}
+            
+            # --- Scan folder for matching texture files ---
             for file_name in os.listdir(selected_folder):
                 for ch in channels:
                     if self.GetBool(self.CHECKBOX_IDS[ch]):
-                        # Allow comma-separated keywords.
                         custom_text = self.GetString(self.TEXTBOX_IDS[ch]).strip()
                         keywords = [kw.strip() for kw in custom_text.split(',')]
                         file_name_clean = file_name.lower().replace("_", "")
@@ -320,12 +291,14 @@ class MyDialog(gui.GeDialog):
                                     ident = ""
                                 channel_files[ch][ident] = os.path.join(selected_folder, file_name)
                                 break
-            # Force channels with only one match to use empty identifier.
+            
+            # --- Force single-match channels to use empty identifier ---
             for ch in channels:
-                if len(channel_files[ch]) == 1 and channel_files[ch]:
+                if len(channel_files[ch]) == 1:
                     val = next(iter(channel_files[ch].values()))
                     channel_files[ch] = {"": val}
-            # Grouping: use the union of identifiers across enabled channels.
+            
+            # --- Gather all identifiers ---
             grouping_channels = [ch for ch in channels if self.GetBool(self.CHECKBOX_IDS[ch]) and len(channel_files[ch]) > 0]
             all_ids = set()
             for ch in grouping_channels:
@@ -335,6 +308,7 @@ class MyDialog(gui.GeDialog):
                 gui.MessageDialog("No texture files found for the enabled channels.")
                 return True
 
+            # --- Build material sets for each identifier ---
             materialSets = {}
             base_material_name = self.GetString(self.MATERIAL_NAME_INPUT).strip()
             for ident in common_ids:
@@ -344,26 +318,19 @@ class MyDialog(gui.GeDialog):
                         ms[ch] = channel_files[ch].get(ident, None)
                     else:
                         ms[ch] = None
-                if ident:
-                    ms["materialName"] = base_material_name + "_" + ident
-                else:
-                    ms["materialName"] = base_material_name
+                ms["materialName"] = base_material_name + "_" + ident if ident else base_material_name
+                ms["ao"] = self.GetBool(self.AO_CHECKBOX)
                 materialSets[ident] = ms
 
-            found_files = {}
-            found_files["materialSets"] = materialSets
-            found_files["folder"] = selected_folder
-            found_files["importObject"] = self.GetBool(self.IMPORT_3D_MODEL_CHECKBOX)
-            found_files["AO"] = self.GetBool(self.AO_CHECKBOX)
-
-            print("\n✅ Found Material Sets:")
-            for ident, ms in materialSets.items():
-                print(f"Identifier '{ident}':")
-                for ch in channels:
-                    print(f"  {ch}: {ms.get(ch)}")
-                print(f"  Material Name: {ms.get('materialName')}")
+            found_files = {
+                "materialSets": materialSets,
+                "folder": selected_folder,
+                "importObject": self.GetBool(self.IMPORT_3D_MODEL_CHECKBOX),
+                "copyTextures": self.GetBool(self.COPY_TEXTURES_CHECKBOX),
+            }
             self.result = found_files
             self.Close()
+        
         return True
 
 # --------------------------------------------------
@@ -374,19 +341,40 @@ def main():
     dlg.Open(dlgtype=c4d.DLG_TYPE_MODAL, defaultw=400, defaulth=300)
     file_paths = dlg.result
     if file_paths is None:
-        return  # User closed the dialog without clicking Create Material
+        return
     doc = c4d.documents.GetActiveDocument()
 
     materialSets = file_paths.get("materialSets", {})
+
+    # --- Copy textures if the option is enabled ---
+    if file_paths.get("copyTextures"):
+        # Get the project file location (if document is saved)
+        project_folder = doc.GetDocumentPath()
+        if not project_folder:
+            # Fallback: use the selected folder if the document isn't saved
+            project_folder = file_paths.get("folder")
+        tex_folder = os.path.join(project_folder, "tex")
+        if not os.path.exists(tex_folder):
+            os.makedirs(tex_folder)
+        for ident, ms in materialSets.items():
+            for ch in ["BaseColor", "Roughness", "Normal", "Displacement"]:
+                if ms.get(ch):
+                    src = ms[ch]
+                    dest = os.path.join(tex_folder, os.path.basename(src))
+                    try:
+                        shutil.copy2(src, dest)
+                        ms[ch] = dest  # Update the texture path to the copied file
+                    except Exception as e:
+                        print("Error copying file:", src, e)
+
+    # --- Create Redshift materials ---
     created_materials = {}
     for ident, ms in materialSets.items():
         mat = create_redshift_material(ms)
         if mat:
             created_materials[ident] = mat
 
-    # If AO checkbox is checked, the AO node was created in the material creation function.
-    # No further action is needed here.
-
+    # --- Optionally import 3D objects ---
     if file_paths.get("importObject") and file_paths.get("folder"):
         folder = file_paths["folder"]
         old_objects = []
