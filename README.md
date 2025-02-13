@@ -13,5 +13,5 @@ Copy textures to a “tex” subfolder of the Cinema 4D project,
 Add an Ambient Occlusion node to the BaseColor chain.
 This streamlines texturing workflows by eliminating manual node creation and ensuring that all relevant textures are discovered, named, and linked automatically.
 
-
+Develop using AI chat tools. (ChatGPT) 
 
