@@ -250,7 +250,7 @@ class MyDialog(gui.GeDialog):
             "BaseColor": "BaseColor, Albedo",
             "Roughness": "Roughness, Rough",
             "Normal": "Normal, Nrm",
-            "Displacement": "Displacement, Disp"
+            "Displacement": "Displacement, Height"
         }
         for ch, checkbox_id in self.CHECKBOX_IDS.items():
             is_checked = True
