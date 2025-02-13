@@ -43,7 +43,7 @@ def create_redshift_material(file_paths):
     mat = doc.GetActiveMaterial()
     if not mat:
         return None
-    mat.SetName(file_paths.get("materialName", "New_Redshift_Material"))
+    mat.SetName(file_paths.get("materialName", "RS Material"))
 
     node_material = mat.GetNodeMaterialReference()
     if node_material is None:
@@ -186,6 +186,7 @@ class MyDialog(gui.GeDialog):
     AO_CHECKBOX = 4002               # AO checkbox
     COPY_TEXTURES_CHECKBOX = 4003    # New Copy Textures checkbox
     CREATE_MATERIAL_BUTTON = 1001
+    PREVIEW_MATERIAL_BUTTON = 1006    # New Preview Materials button
 
     CHECKBOX_IDS = {
         "BaseColor": 2001,
@@ -227,19 +228,23 @@ class MyDialog(gui.GeDialog):
         
         # --- Additional Options in One Horizontal Row ---
         self.GroupBegin(8000, c4d.BFH_LEFT, 3, 1)  # 3 columns, 1 row
-        # You can adjust the widths below to ensure text fits nicely:
         self.AddCheckbox(self.IMPORT_3D_MODEL_CHECKBOX, c4d.BFH_LEFT, 165, 15, "Import 3D Model")
         self.AddCheckbox(self.AO_CHECKBOX, c4d.BFH_LEFT, 55, 15, "AO")
         self.AddCheckbox(self.COPY_TEXTURES_CHECKBOX, c4d.BFH_LEFT, 100, 15, "Copy Textures")
         self.GroupEnd()
         
-        # --- Create Material Button ---
+        # --- Material Buttons Row (Create & Preview) ---
+        self.GroupBegin(9001, c4d.BFH_CENTER, 2, 1)
         self.AddButton(self.CREATE_MATERIAL_BUTTON, c4d.BFH_CENTER, 120, 15, "Create Material")
+        self.AddButton(self.PREVIEW_MATERIAL_BUTTON, c4d.BFH_CENTER, 120, 15, "Preview Materials")
+        self.GroupEnd()
+        
         return True
 
     def InitValues(self):
         self.SetString(self.FOLDER_INPUT, "")
-        self.SetString(self.MATERIAL_NAME_INPUT, "New_Redshift_Material")
+        # Default material name changed to "RS Material"
+        self.SetString(self.MATERIAL_NAME_INPUT, "RS Material")
         
         default_texts = {
             "BaseColor": "BaseColor, Albedo",
@@ -267,7 +272,8 @@ class MyDialog(gui.GeDialog):
             if folder_path:
                 self.SetString(self.FOLDER_INPUT, folder_path)
         
-        if id == self.CREATE_MATERIAL_BUTTON:
+        # Preview Materials button command
+        if id == self.PREVIEW_MATERIAL_BUTTON:
             selected_folder = self.GetString(self.FOLDER_INPUT).strip()
             if not selected_folder or not os.path.exists(selected_folder):
                 gui.MessageDialog("Please select a valid folder.")
@@ -276,7 +282,7 @@ class MyDialog(gui.GeDialog):
             channels = ["BaseColor", "Roughness", "Normal", "Displacement"]
             channel_files = {ch: {} for ch in channels}
             
-            # --- Scan folder for matching texture files ---
+            # Scan folder for matching texture files
             for file_name in os.listdir(selected_folder):
                 for ch in channels:
                     if self.GetBool(self.CHECKBOX_IDS[ch]):
@@ -292,33 +298,95 @@ class MyDialog(gui.GeDialog):
                                 channel_files[ch][ident] = os.path.join(selected_folder, file_name)
                                 break
             
-            # --- Force single-match channels to use empty identifier ---
+            # Force single-match channels to use empty identifier
             for ch in channels:
                 if len(channel_files[ch]) == 1:
                     val = next(iter(channel_files[ch].values()))
                     channel_files[ch] = {"": val}
             
-            # --- Gather all identifiers ---
+            # Gather all identifiers and build materialSets
             grouping_channels = [ch for ch in channels if self.GetBool(self.CHECKBOX_IDS[ch]) and len(channel_files[ch]) > 0]
             all_ids = set()
             for ch in grouping_channels:
                 all_ids = all_ids.union(set(channel_files[ch].keys()))
-            common_ids = all_ids
-            if not common_ids:
+            if not all_ids:
                 gui.MessageDialog("No texture files found for the enabled channels.")
                 return True
-
-            # --- Build material sets for each identifier ---
+            
             materialSets = {}
             base_material_name = self.GetString(self.MATERIAL_NAME_INPUT).strip()
-            for ident in common_ids:
+            for ident in all_ids:
                 ms = {}
                 for ch in channels:
                     if self.GetBool(self.CHECKBOX_IDS[ch]):
                         ms[ch] = channel_files[ch].get(ident, None)
                     else:
                         ms[ch] = None
-                ms["materialName"] = base_material_name + "_" + ident if ident else base_material_name
+                ms["materialName"] = (base_material_name + "_" + ident) if ident else base_material_name
+                ms["ao"] = self.GetBool(self.AO_CHECKBOX)
+                materialSets[ident] = ms
+
+            # Build a preview text from materialSets
+            preview_text = ""
+            for ident, ms in materialSets.items():
+                preview_text += f"Material: {ms['materialName']}\n"
+                for ch in channels:
+                    if ms.get(ch):
+                        preview_text += f"  {ch}: {os.path.basename(ms[ch])}\n"
+                preview_text += "\n"
+            gui.MessageDialog(preview_text)
+        
+        # Create Material button command
+        if id == self.CREATE_MATERIAL_BUTTON:
+            selected_folder = self.GetString(self.FOLDER_INPUT).strip()
+            if not selected_folder or not os.path.exists(selected_folder):
+                gui.MessageDialog("Please select a valid folder.")
+                return True
+
+            channels = ["BaseColor", "Roughness", "Normal", "Displacement"]
+            channel_files = {ch: {} for ch in channels}
+            
+            # Scan folder for matching texture files
+            for file_name in os.listdir(selected_folder):
+                for ch in channels:
+                    if self.GetBool(self.CHECKBOX_IDS[ch]):
+                        custom_text = self.GetString(self.TEXTBOX_IDS[ch]).strip()
+                        keywords = [kw.strip() for kw in custom_text.split(',')]
+                        file_name_clean = file_name.lower().replace("_", "")
+                        for kw in keywords:
+                            kw_clean = kw.lower().replace("_", "")
+                            if kw_clean in file_name_clean:
+                                ident = extract_identifier(file_name, kw)
+                                if ident is None:
+                                    ident = ""
+                                channel_files[ch][ident] = os.path.join(selected_folder, file_name)
+                                break
+            
+            # Force single-match channels to use empty identifier
+            for ch in channels:
+                if len(channel_files[ch]) == 1:
+                    val = next(iter(channel_files[ch].values()))
+                    channel_files[ch] = {"": val}
+            
+            # Gather all identifiers and build materialSets
+            grouping_channels = [ch for ch in channels if self.GetBool(self.CHECKBOX_IDS[ch]) and len(channel_files[ch]) > 0]
+            all_ids = set()
+            for ch in grouping_channels:
+                all_ids = all_ids.union(set(channel_files[ch].keys()))
+            if not all_ids:
+                gui.MessageDialog("No texture files found for the enabled channels.")
+                return True
+
+            materialSets = {}
+            base_material_name = self.GetString(self.MATERIAL_NAME_INPUT).strip()
+            for ident in all_ids:
+                ms = {}
+                for ch in channels:
+                    if self.GetBool(self.CHECKBOX_IDS[ch]):
+                        ms[ch] = channel_files[ch].get(ident, None)
+                    else:
+                        ms[ch] = None
+                ms["materialName"] = (base_material_name + "_" + ident) if ident else base_material_name
                 ms["ao"] = self.GetBool(self.AO_CHECKBOX)
                 materialSets[ident] = ms
 
