@@ -90,7 +90,7 @@ def create_redshift_material(file_paths):
 
     with graph.BeginTransaction() as tr:
         try:
-            # 1) Create TextureSampler nodes
+            # 1) Create TextureSampler nodes and set all to RAW colorspace
             for ch in channels:
                 path = file_paths.get(ch)
                 if path:
@@ -100,9 +100,9 @@ def create_redshift_material(file_paths):
                         "com.redshift3d.redshift4c4d.nodes.core.texturesampler.tex0"
                     )
                     if inp:
-                        if ch in ("Normal", "Displacement"):
-                            cs = inp.FindChild("colorspace")
-                            cs and cs.SetDefaultValue("RS_INPUT_COLORSPACE_RAW")
+                        # Set RAW colorspace for every map
+                        cs = inp.FindChild("colorspace")
+                        cs and cs.SetDefaultValue("RS_INPUT_COLORSPACE_RAW")
                         p = inp.FindChild("path")
                         p and p.SetDefaultValue(maxon.Url(path))
                 else:
@@ -271,15 +271,15 @@ def create_redshift_material(file_paths):
 # UI Dialog for File Selection & Texture Search
 # --------------------------------------------------
 class MyDialog(gui.GeDialog):
-    MATERIAL_NAME_INPUT       = 1005
-    FOLDER_INPUT              = 1002
-    SELECT_FOLDER_BUTTON      = 1003
-    IMPORT_3D_MODEL_CHECKBOX  = 4001
-    AO_CHECKBOX               = 4002
-    COPY_TEXTURES_CHECKBOX    = 4003
-    GAME_ASSET_CHECKBOX       = 4004
-    CREATE_MATERIAL_BUTTON    = 1001
-    PREVIEW_MATERIAL_BUTTON   = 1006
+    MATERIAL_NAME_INPUT      = 1005
+    FOLDER_INPUT             = 1002
+    SELECT_FOLDER_BUTTON     = 1003
+    IMPORT_3D_MODEL_CHECKBOX = 4001
+    AO_CHECKBOX              = 4002
+    COPY_TEXTURES_CHECKBOX   = 4003
+    GAME_ASSET_CHECKBOX      = 4004
+    CREATE_MATERIAL_BUTTON   = 1001
+    PREVIEW_MATERIAL_BUTTON  = 1006
 
     CHECKBOX_IDS = {
         "BaseColor":    2001,
@@ -344,7 +344,6 @@ class MyDialog(gui.GeDialog):
     def InitValues(self):
         self.SetString(self.FOLDER_INPUT, "")
         self.SetString(self.MATERIAL_NAME_INPUT, "RS Material")
-
         default_texts = {
             "BaseColor":    "BaseColor, Albedo",
             "Roughness":    "Roughness, Rough",
@@ -353,9 +352,7 @@ class MyDialog(gui.GeDialog):
             "Opacity":      "Opacity, Alpha",
             "Metalness":    "Metalness, Mtl"
         }
-
         for ch, cb in self.CHECKBOX_IDS.items():
-            # Opacity and Metalness default to unchecked
             default_state = False if ch in ("Opacity", "Metalness") else True
             self.SetBool(cb, default_state)
             self.SetString(self.TEXTBOX_IDS[ch], default_texts[ch])
