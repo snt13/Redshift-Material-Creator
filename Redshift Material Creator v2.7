@@ -1,0 +1,1727 @@
+"""
+Redshift Material Creator for Cinema 4D
+=======================================
+
+Batch-builds Redshift node materials from a folder of PBR texture maps.
+Point it at an export folder, it groups the maps into material sets by
+filename and wires up a StandardMaterial for each one.
+
+Verified against Cinema 4D 2025.3 + Redshift.
+
+Runs two ways from this one file:
+  * Script Manager - keep the .py extension and hit Execute.
+  * Plugin - copy it into a Cinema 4D "plugins" folder and rename it to
+    .pyp. It then registers a command you can put in a menu or bind to a
+    shortcut. (Register a real PLUGIN_ID at developers.maxon.net first.)
+
+Version history lives in CHANGELOG.md next to this file, not here.
+Tests: python test_material_creator.py  (runs outside Cinema 4D).
+"""
+
+__version__ = "2.7"
+
+import c4d
+import maxon
+import os
+import re
+import shutil
+from c4d import gui, storage
+
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
+
+# Characters treated as word separators when matching a keyword against a
+# filename. They are ignored for MATCHING but preserved in the returned name.
+SEPARATOR_CHARS = "_- ."
+
+# Only these extensions are considered texture files.
+TEXTURE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".exr", ".tga"
+}
+
+
+# --------------------------------------------------
+# Helper: normalize a string for matching, keeping a map back to the original
+# --------------------------------------------------
+def _normalize_with_map(text):
+    """
+    Returns (normalized, index_map) where `normalized` is `text` lowercased
+    with all separator characters removed, and index_map[i] is the index in
+    the ORIGINAL text of the i-th character of `normalized`.
+    """
+    normalized = []
+    index_map = []
+    for i, ch in enumerate(text):
+        if ch in SEPARATOR_CHARS:
+            continue
+        normalized.append(ch.lower())
+        index_map.append(i)
+    return "".join(normalized), index_map
+
+
+def _strip_separators(text):
+    return text.strip(SEPARATOR_CHARS)
+
+
+# --------------------------------------------------
+# Helper: Extract identifier from filename using a given keyword
+#
+# The keyword is matched case-insensitively and ignoring separators, but the
+# returned identifier keeps the ORIGINAL spelling of the filename, including
+# underscores and capitalisation.
+#
+#   "T_Wood_Planks_BaseColor_2K.png" + "BaseColor" -> "T_Wood_Planks_2K"
+#   "Rock_Rough.png"                 + "Rough"     -> "Rock"
+#   "BaseColor.png"                  + "BaseColor" -> ""   (matched, no name)
+#   "Rock_Normal.png"                + "Rough"     -> None (no match)
+# --------------------------------------------------
+def extract_identifier(file_name, keyword, require_boundary=False):
+    """
+    `require_boundary` makes the keyword match only where it is delimited by a
+    separator or by the start/end of the name. Matching normally ignores
+    separators entirely, which is right for long keywords but dangerous for
+    very short ones: "AO" otherwise matches the letters inside
+    "Cacao_BaseColor". See BOUNDARY_MATCH_CHANNELS.
+    """
+    base = os.path.splitext(file_name)[0]
+
+    norm_base, index_map = _normalize_with_map(base)
+    norm_keyword, _ = _normalize_with_map(keyword)
+    if not norm_keyword:
+        return None
+
+    pos = norm_base.rfind(norm_keyword)
+    while require_boundary and pos >= 0:
+        first = index_map[pos]
+        last = index_map[pos + len(norm_keyword) - 1]
+        before_ok = first == 0 or base[first - 1] in SEPARATOR_CHARS
+        after_ok = last == len(base) - 1 or base[last + 1] in SEPARATOR_CHARS
+        if before_ok and after_ok:
+            break
+        pos = norm_base.rfind(norm_keyword, 0, pos)
+    if pos < 0:
+        return None
+
+    start = index_map[pos]
+    end = index_map[pos + len(norm_keyword) - 1] + 1
+
+    before = _strip_separators(base[:start])
+    after = _strip_separators(base[end:])
+
+    if before and after:
+        return "{}_{}".format(before, after)
+    return before or after
+
+
+# Tokens Substance and friends append to normal maps to note their format.
+# They are dropped from the identifier so that "Wood_Normal_DirectX.png" still
+# groups with "Wood_BaseColor.png" instead of creating a second material.
+NORMAL_FORMAT_TOKENS = {"directx", "dx", "opengl", "ogl", "gl"}
+
+
+def strip_normal_format_tokens(identifier):
+    if not identifier:
+        return identifier
+    parts = re.split(r'([{}])'.format(re.escape(SEPARATOR_CHARS)), identifier)
+    kept = [p for p in parts
+            if p in SEPARATOR_CHARS or p.lower() not in NORMAL_FORMAT_TOKENS]
+    joined = "".join(kept)
+    # Dropping a token from the MIDDLE leaves its separators on both sides:
+    # "Wood_OpenGL_2K" -> "Wood__2K". Collapse any run back to one.
+    joined = re.sub(r'[{}]{{2,}}'.format(re.escape(SEPARATOR_CHARS)),
+                    lambda match: match.group(0)[0], joined)
+    return _strip_separators(joined)
+
+
+def identifier_key(identifier):
+    """Case/separator-insensitive key used to group maps into one material."""
+    norm, _ = _normalize_with_map(identifier or "")
+    return norm
+
+
+# --------------------------------------------------
+# Helper: Recursively gather all objects under a root
+# --------------------------------------------------
+def get_all_objects(obj):
+    result = []
+    while obj:
+        result.append(obj)
+        result += get_all_objects(obj.GetDown())
+        obj = obj.GetNext()
+    return result
+
+
+# --------------------------------------------------
+# Helper: port lookup that tolerates Redshift/maxon API differences
+# --------------------------------------------------
+def _iter_ports(port_list):
+    if port_list is None:
+        return []
+    try:
+        children = port_list.GetChildren()
+        if children:
+            return list(children)
+    except Exception:
+        pass
+    collected = []
+    try:
+        def _cb(child):
+            collected.append(child)
+            return True
+        port_list.GetChildren(_cb, maxon.NODE_KIND.INPORT)
+    except Exception:
+        pass
+    return collected
+
+
+def find_port(port_list, exact_ids=None, suffixes=None):
+    """
+    Find a port by full id first, then by id suffix. Returns None if absent.
+    """
+    if port_list is None:
+        return None
+
+    for pid in (exact_ids or []):
+        try:
+            port = port_list.FindChild(pid)
+            if port:
+                return port
+        except Exception:
+            pass
+
+    if suffixes:
+        ports = _iter_ports(port_list)
+        for suffix in suffixes:
+            suffix = suffix.lower()
+            for port in ports:
+                try:
+                    if str(port.GetId()).lower().endswith(suffix):
+                        return port
+                except Exception:
+                    continue
+    return None
+
+
+def _set_color_port(port, r, g, b):
+    """Set a color-ish port, trying the types Redshift may expose."""
+    if port is None:
+        return False
+    for value in (maxon.Color(r, g, b), maxon.Vector(r, g, b)):
+        try:
+            port.SetDefaultValue(value)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+# --------------------------------------------------
+# Normal map green-channel flip
+# --------------------------------------------------
+def apply_normal_flip(bump_node, texture_node):
+    """
+    Flip the green (Y) channel of a tangent-space normal map.
+    DirectX-authored normals (Substance default) need this for Redshift,
+    which expects OpenGL orientation.
+
+    Preferred path: the Bump Map node's own Flip Y switch.
+    Fallback: invert green on the Texture Sampler via colour multiplier/offset
+              ( out = tex * (1,-1,1) + (0,1,0) ).
+    """
+    flip_port = find_port(
+        bump_node.GetInputs(),
+        exact_ids=[
+            "com.redshift3d.redshift4c4d.nodes.core.bumpmap.flipy",
+            "com.redshift3d.redshift4c4d.nodes.core.bumpmap.flip_y",
+        ],
+        suffixes=["flipy", "flip_y", "flipbitangent", "flip_bitangent"],
+    )
+    if flip_port is not None:
+        try:
+            flip_port.SetDefaultValue(maxon.Bool(True))
+            return "bumpmap.flipY"
+        except Exception:
+            pass
+
+    inputs = texture_node.GetInputs()
+    mult = find_port(
+        inputs,
+        exact_ids=["com.redshift3d.redshift4c4d.nodes.core.texturesampler.color_multiplier"],
+        suffixes=["color_multiplier", "colormultiplier"],
+    )
+    offset = find_port(
+        inputs,
+        exact_ids=["com.redshift3d.redshift4c4d.nodes.core.texturesampler.color_offset"],
+        suffixes=["color_offset", "coloroffset"],
+    )
+    if _set_color_port(mult, 1.0, -1.0, 1.0) and _set_color_port(offset, 0.0, 1.0, 0.0):
+        return "textureSampler multiplier/offset"
+
+    print("[Material Creator] Could not flip the normal map's green channel "
+          "- no Flip Y port and no colour multiplier/offset on this Redshift build.")
+    return None
+
+
+# --------------------------------------------------
+# Node graph helpers
+#
+# Every Redshift node and port is addressed by a long dotted id. GraphBuilder
+# takes the short form ("texturesampler.outcolor"), expands it, resolves the
+# port and - crucially - records a readable message when something is missing.
+#
+# v1.1 used the idiom `a and b and a.Connect(b)`, which silently produced a
+# material with a missing wire and no indication that anything went wrong.
+# Every connection now either happens or shows up in `warnings`.
+# --------------------------------------------------
+RS_NODESPACE = maxon.Id("com.redshift3d.redshift4c4d.class.nodespace")
+RS_NODE_PREFIX = "com.redshift3d.redshift4c4d.nodes.core."
+RS_OUTPUT_NODE = "com.redshift3d.redshift4c4d.node.output"
+
+
+def rs_node_id(short_id):
+    """'texturesampler' -> maxon.Id('com...nodes.core.texturesampler')."""
+    if short_id.startswith("com."):
+        return maxon.Id(short_id)
+    return maxon.Id(RS_NODE_PREFIX + short_id)
+
+
+def rs_port_id(short_id):
+    """'bumpmap.out' -> 'com...nodes.core.bumpmap.out'. Full ids pass through."""
+    if short_id.startswith("com."):
+        return short_id
+    return RS_NODE_PREFIX + short_id
+
+
+class GraphBuilder(object):
+    """
+    Thin wrapper around one Redshift node graph.
+
+    Methods return True/False rather than raising, and append a short message
+    to `self.warnings` whenever a node or port could not be resolved, so the
+    caller can report everything that went wrong in one dialog at the end.
+    """
+
+    def __init__(self, graph, material_name=""):
+        self.graph = graph
+        self.material_name = material_name or "material"
+        self.warnings = []
+
+    # ---- reporting ------------------------------------------------
+    def warn(self, message):
+        text = "[{}] {}".format(self.material_name, message)
+        self.warnings.append(text)
+        print("[Material Creator] " + text)
+
+    # ---- creation -------------------------------------------------
+    def add(self, short_id, name=None):
+        """Create a node. Returns the node, or None (and warns) on failure."""
+        try:
+            node = self.graph.AddChild("", rs_node_id(short_id), maxon.DataDictionary())
+        except Exception as exc:
+            self.warn("could not create node '{}' ({})".format(short_id, exc))
+            return None
+        if node is None:
+            self.warn("could not create node '{}'".format(short_id))
+            return None
+        if name:
+            self.set_name(node, name)
+        return node
+
+    def set_name(self, node, name):
+        """Label a node in the node editor. Cosmetic - never fatal."""
+        if node is None:
+            return False
+        try:
+            node.SetValue(maxon.NODE.BASE.NAME, maxon.String(name))
+            return True
+        except Exception:
+            return False
+
+    # ---- ports ----------------------------------------------------
+    def port(self, node, short_port, direction="in"):
+        """
+        Resolve a port by full id, falling back to a suffix match so the tool
+        survives small port-id changes between Redshift builds.
+        """
+        if node is None:
+            return None
+        try:
+            port_list = node.GetInputs() if direction == "in" else node.GetOutputs()
+        except Exception:
+            return None
+        full = rs_port_id(short_port)
+        return find_port(port_list, exact_ids=[full], suffixes=[full.rsplit(".", 1)[-1]])
+
+    def connect(self, src_node, src_port, dst_node, dst_port):
+        """Wire one output to one input."""
+        out = self.port(src_node, src_port, "out")
+        inp = self.port(dst_node, dst_port, "in")
+        if out is None:
+            self.warn("output port '{}' not found".format(src_port))
+            return False
+        if inp is None:
+            self.warn("input port '{}' not found".format(dst_port))
+            return False
+        try:
+            out.Connect(inp)
+            return True
+        except Exception as exc:
+            self.warn("could not connect {} -> {} ({})".format(src_port, dst_port, exc))
+            return False
+
+    def connect_from(self, source, dst_node, dst_port):
+        """
+        Wire from a (node, port) pair - the form the per-channel `chain` dict
+        uses, so inserting a node mid-chain is a one-line change.
+        """
+        if not source or source[0] is None:
+            return False
+        return self.connect(source[0], source[1], dst_node, dst_port)
+
+    # ---- values ---------------------------------------------------
+    def set_value(self, node, short_port, value):
+        port = self.port(node, short_port, "in")
+        if port is None:
+            self.warn("input port '{}' not found - value not set".format(short_port))
+            return False
+        try:
+            port.SetDefaultValue(value)
+            return True
+        except Exception as exc:
+            self.warn("could not set '{}' ({})".format(short_port, exc))
+            return False
+
+    def set_color(self, node, short_port, r, g, b):
+        port = self.port(node, short_port, "in")
+        if port is None:
+            self.warn("input port '{}' not found - colour not set".format(short_port))
+            return False
+        if _set_color_port(port, r, g, b):
+            return True
+        self.warn("could not set colour on '{}'".format(short_port))
+        return False
+
+    # ---- rewiring --------------------------------------------------
+    def disconnect(self, src_node, src_port, dst_node, dst_port):
+        """
+        Remove an existing wire. Connecting a second source to an input does
+        NOT replace the first one in a maxon graph - both survive - so the
+        default StandardMaterial -> Output.surface wire has to be removed
+        before the Material Blender can take its place.
+        """
+        out = self.port(src_node, src_port, "out")
+        inp = self.port(dst_node, dst_port, "in")
+        if out is None or inp is None:
+            self.warn("could not disconnect {} -> {} (port missing)".format(
+                src_port, dst_port))
+            return False
+        try:
+            maxon.GraphModelHelper.RemoveConnection(out, inp)
+            return True
+        except Exception as exc:
+            self.warn("could not disconnect {} -> {} ({})".format(
+                src_port, dst_port, exc))
+            return False
+
+    def set_texture(self, node, path, colorspace):
+        """
+        Point a TextureSampler at a file. Path and colorspace live on children
+        of the `tex0` port, not on tex0 itself.
+        """
+        tex0 = self.port(node, "texturesampler.tex0", "in")
+        if tex0 is None:
+            self.warn("texture sampler has no 'tex0' port - '{}' not loaded".format(
+                os.path.basename(path)))
+            return False
+        ok = True
+        try:
+            cs = tex0.FindChild("colorspace")
+            if cs:
+                cs.SetDefaultValue(colorspace)
+            else:
+                ok = False
+        except Exception:
+            ok = False
+        try:
+            p = tex0.FindChild("path")
+            if p:
+                p.SetDefaultValue(maxon.Url(path))
+            else:
+                ok = False
+                self.warn("could not set texture path for '{}'".format(
+                    os.path.basename(path)))
+        except Exception as exc:
+            ok = False
+            self.warn("could not set texture path for '{}' ({})".format(
+                os.path.basename(path), exc))
+        return ok
+
+    def find_single(self, short_id, label):
+        """Find the one node of a given asset id in the default graph."""
+        found = []
+        try:
+            maxon.GraphModelHelper.FindNodesByAssetId(
+                self.graph, rs_node_id(short_id), True, found)
+        except Exception as exc:
+            self.warn("could not look up {} ({})".format(label, exc))
+            return None
+        if not found:
+            self.warn("{} node not found in the default graph".format(label))
+            return None
+        return found[0]
+
+
+# --------------------------------------------------
+# Channel table
+#
+# Adding a channel is now one entry here plus one wiring block below, instead
+# of a new branch copied from an existing one.
+# --------------------------------------------------
+MATERIAL_CHANNELS = ["BaseColor", "AO", "Roughness", "Normal",
+                     "Displacement", "Opacity", "Metalness"]
+
+# BaseColor is the only colour map - everything else is data and stays RAW.
+# AO has no keyword field in the dialog - the single AO checkbox in Options
+# drives everything. These are only searched for when that box is ticked,
+# which also means the short "AO" spelling can never produce a false positive
+# on a run that is not using AO at all.
+AO_KEYWORDS = ["AmbientOcclusion", "Ambient_Occlusion", "Occlusion", "AO"]
+
+# Channels whose keywords must sit on a separator boundary in the filename.
+# Matching normally ignores separators, which is what lets "base color" match
+# "BaseColor" - but it also means a two-letter keyword matches anywhere, and
+# "AO" was being found inside "Cacao_BaseColor".
+BOUNDARY_MATCH_CHANNELS = ("AO",)
+
+CHANNEL_COLORSPACES = {
+    "BaseColor": "RS_INPUT_COLORSPACE_SRGB",
+    "AO": "RS_INPUT_COLORSPACE_RAW",
+    "Roughness": "RS_INPUT_COLORSPACE_RAW",
+    "Normal": "RS_INPUT_COLORSPACE_RAW",
+    "Displacement": "RS_INPUT_COLORSPACE_RAW",
+    "Opacity": "RS_INPUT_COLORSPACE_RAW",
+    "Metalness": "RS_INPUT_COLORSPACE_RAW",
+}
+
+# With "Game Asset" on, these maps are greyscale packed into RGB, so they go
+# through a ColorSplitter and only the red channel is used.
+GAME_ASSET_SPLIT_CHANNELS = ("Roughness", "Opacity", "AO")
+
+# Redshift's own default for triplanar.scale. The dialog's Size field holds
+# this value directly - smaller number, bigger texture.
+TRIPLANAR_DEFAULT_SIZE = 0.01
+
+# Look of the generated blend material (layer 1 of the Material Blender).
+BLEND_MATERIAL_COLOR = (0.09, 0.06, 0.04)
+BLEND_MATERIAL_ROUGHNESS = 0.85
+BLEND_MATERIAL_METALNESS = 0.0
+
+
+# --------------------------------------------------
+# Material Creation
+#
+# Returns (material, warnings). `warnings` is empty when every node and port
+# resolved; the caller collects them across the batch and reports once.
+# --------------------------------------------------
+def create_redshift_material(file_paths):
+    doc = c4d.documents.GetActiveDocument()
+    if not doc:
+        return None, ["No active document."]
+
+    material_name = file_paths.get("materialName", "RS Material")
+
+    # Built directly instead of through c4d.CallCommand(1040254, 1012), the
+    # Redshift preset menu. That relied on an undocumented menu id, hijacked
+    # whatever material happened to be active, and gave no handle on the
+    # moment of insertion - which is exactly what undo support needs.
+    mat = c4d.BaseMaterial(c4d.Mmaterial)
+    mat.SetName(material_name)
+
+    node_material = mat.GetNodeMaterialReference()
+    if node_material is None:
+        return None, ["'{}' has no node material.".format(material_name)]
+
+    graph = node_material.CreateDefaultGraph(RS_NODESPACE)
+    if graph is None or graph.IsNullValue():
+        return None, ["'{}' - could not create the Redshift graph.".format(material_name)]
+
+    gb = GraphBuilder(graph, material_name)
+
+    std_node = gb.find_single("standardmaterial", "Standard Material")
+    output_node = gb.find_single(RS_OUTPUT_NODE, "Output")
+    if std_node is None or output_node is None:
+        return None, gb.warnings
+
+    game_asset = file_paths.get("gameAsset", False)
+    flip_green = file_paths.get("flipGreen", False)
+
+    triplanar = file_paths.get("triplanar", False)
+    tri_size = float(file_paths.get("triplanarSize", TRIPLANAR_DEFAULT_SIZE))
+
+    curvature_blend = file_paths.get("curvature", False)
+
+    # chain[channel] = (node, output_port) - the current end of that channel's
+    # signal path. Every step reads it, wires from it, and overwrites it.
+    chain = {}
+    texture_nodes = {}
+
+    with graph.BeginTransaction() as tr:
+        try:
+            # 1) One column per channel: Texture Sampler -> [TriPlanar]
+            #    -> [ColorSplitter]. Built channel by channel rather than
+            #    layer by layer, so each channel's nodes end up adjacent in
+            #    the node editor instead of interleaved.
+            size_node = None
+            if triplanar:
+                size_node = gb.add("rsscalarconstant", "Size")
+                gb.set_value(size_node, "rsscalarconstant.val",
+                             maxon.Float64(tri_size))
+
+            for ch in MATERIAL_CHANNELS:
+                path = file_paths.get(ch)
+                if not path:
+                    continue
+                # An AO map is only worth loading if AO is switched on -
+                # otherwise it would sit in the graph unconnected.
+                if ch == "AO" and not file_paths.get("ao"):
+                    continue
+
+                tn = gb.add("texturesampler", "{} Tex".format(ch))
+                if tn is None:
+                    continue
+                gb.set_texture(tn, path, CHANNEL_COLORSPACES.get(
+                    ch, "RS_INPUT_COLORSPACE_RAW"))
+                texture_nodes[ch] = tn
+                chain[ch] = (tn, "texturesampler.outcolor")
+
+                # TriPlanar, with its Scale wired straight to the shared
+                # Size node.
+                if size_node is not None:
+                    tp = gb.add("triplanar", "{} Triplanar".format(ch))
+                    if tp is not None:
+                        gb.connect_from(chain[ch], tp, "triplanar.imagex")
+
+                        # One image on all three axes. If that switch is
+                        # missing on this Redshift build, wire Y and Z by hand.
+                        if not gb.set_value(tp, "triplanar.sameimageoneachaxis",
+                                            maxon.Bool(True)):
+                            gb.connect_from(chain[ch], tp, "triplanar.imagey")
+                            gb.connect_from(chain[ch], tp, "triplanar.imagez")
+
+                        gb.connect(size_node, "rsscalarconstant.out",
+                                   tp, "triplanar.scale")
+
+                        chain[ch] = (tp, "triplanar.outcolor")
+
+                # Game Asset: packed greyscale map, keep red.
+                if game_asset and ch in GAME_ASSET_SPLIT_CHANNELS:
+                    sp = gb.add("rscolorsplitter", "{} Split".format(ch))
+                    if sp is not None:
+                        gb.connect_from(chain[ch], sp, "rscolorsplitter.input")
+                        chain[ch] = (sp, "rscolorsplitter.outr")
+
+
+            # 2) BaseColor -> ColorCorrection -> (AO?) -> standard.base_color
+            if "BaseColor" in chain:
+                cc = gb.add("rscolorcorrection", "BaseColor CC")
+                if cc is not None:
+                    gb.connect_from(chain["BaseColor"], cc, "rscolorcorrection.input")
+                    chain["BaseColor"] = (cc, "rscolorcorrection.outcolor")
+
+                # AO. A baked map is always better than a procedural guess,
+                # so if the texture set has one it wins; the Redshift
+                # ambient-occlusion node is the fallback when it does not.
+                if file_paths.get("ao"):
+                    if "AO" in chain:
+                        mul = gb.add("rsmathmulvector", "AO Multiply")
+                        if mul is not None:
+                            gb.connect_from(chain["BaseColor"], mul,
+                                            "rsmathmulvector.input1")
+                            gb.connect_from(chain["AO"], mul,
+                                            "rsmathmulvector.input2")
+                            chain["BaseColor"] = (mul, "rsmathmulvector.out")
+                    else:
+                        ao = gb.add("ambientocclusion", "AO")
+                        if ao is not None:
+                            gb.connect_from(chain["BaseColor"], ao,
+                                            "ambientocclusion.bright")
+                            chain["BaseColor"] = (ao, "ambientocclusion.out")
+
+                gb.connect_from(chain["BaseColor"], std_node,
+                                "standardmaterial.base_color")
+
+            # 3) Roughness -> Ramp -> standard.refl_roughness
+            if "Roughness" in chain:
+                ramp = gb.add("rsramp", "Roughness Ramp")
+                if ramp is not None:
+                    gb.connect_from(chain["Roughness"], ramp, "rsramp.input")
+                    chain["Roughness"] = (ramp, "rsramp.outcolor")
+                gb.connect_from(chain["Roughness"], std_node,
+                                "standardmaterial.refl_roughness")
+
+            # 4) Normal -> BumpMap (tangent-space normal) -> standard.bump_input
+            if "Normal" in chain:
+                bm = gb.add("bumpmap", "Normal Bump")
+                if bm is not None:
+                    gb.set_value(bm, "bumpmap.inputtype", maxon.Int32(1))
+
+                    # DirectX source (Substance default) -> flip Y for Redshift.
+                    # OpenGL source -> leave untouched.
+                    if flip_green:
+                        method = apply_normal_flip(bm, texture_nodes.get("Normal"))
+                        if method is None:
+                            gb.warn("normal green channel could not be flipped - "
+                                    "no Flip Y port and no colour multiplier/offset")
+
+                    gb.connect_from(chain["Normal"], bm, "bumpmap.input")
+                    chain["Normal"] = (bm, "bumpmap.out")
+                    gb.connect_from(chain["Normal"], std_node,
+                                    "standardmaterial.bump_input")
+
+            # 5) Displacement -> output.displacement
+            if "Displacement" in chain:
+                dp = gb.add("displacement", "Displacement")
+                if dp is not None:
+                    gb.connect_from(chain["Displacement"], dp, "displacement.texmap")
+                    chain["Displacement"] = (dp, "displacement.out")
+                    gb.connect_from(chain["Displacement"], output_node,
+                                    RS_OUTPUT_NODE + ".displacement")
+
+            # 6) Opacity -> standard.opacity_color
+            if "Opacity" in chain:
+                gb.connect_from(chain["Opacity"], std_node,
+                                "standardmaterial.opacity_color")
+
+            # 7) Metalness -> standard.metalness
+            if "Metalness" in chain:
+                gb.connect_from(chain["Metalness"], std_node,
+                                "standardmaterial.metalness")
+
+            # 8) Curvature blend.
+            #
+            #     Curvature -> Mul (intensity) -> Mul (x mask texture) -> the
+            #     Material Blender's blend mask. The textured material becomes
+            #     the blender's base, a generated blend material its layer 1.
+            #
+            #     Intensity, radius and the mask texture are deliberately NOT
+            #     in the dialog - the nodes are built and tuned in the node
+            #     editor, where you can see what you are doing.
+            if curvature_blend:
+                blender = gb.add("materialblender", "Curvature Blender")
+                blend_mat = gb.add("standardmaterial", "Blend Material")
+                gb.set_color(blend_mat, "standardmaterial.base_color",
+                             *BLEND_MATERIAL_COLOR)
+                gb.set_value(blend_mat, "standardmaterial.refl_roughness",
+                             maxon.Float64(BLEND_MATERIAL_ROUGHNESS))
+                gb.set_value(blend_mat, "standardmaterial.metalness",
+                             maxon.Float64(BLEND_MATERIAL_METALNESS))
+
+                curv = gb.add("curvature", "Curvature")
+
+                mul_intensity = gb.add("rsmathmul", "Curvature Intensity")
+                gb.connect(curv, "curvature.out", mul_intensity, "rsmathmul.input1")
+
+                mask_tex = gb.add("texturesampler", "Curvature Texture")
+                mask_cc = gb.add("rscolorcorrection", "Curvature CC")
+                gb.connect(mask_tex, "texturesampler.outcolor",
+                           mask_cc, "rscolorcorrection.input")
+
+                mul_mask = gb.add("rsmathmul", "Curvature Mask")
+                gb.connect(mul_intensity, "rsmathmul.out", mul_mask, "rsmathmul.input1")
+                gb.connect(mask_cc, "rscolorcorrection.outcolor",
+                           mul_mask, "rsmathmul.input2")
+
+                # The default graph already wires StandardMaterial -> surface.
+                # A second connection would not replace it, so remove it first.
+                gb.disconnect(std_node, "standardmaterial.outcolor",
+                              output_node, RS_OUTPUT_NODE + ".surface")
+                gb.connect(std_node, "standardmaterial.outcolor",
+                           blender, "materialblender.basecolor")
+                gb.connect(blend_mat, "standardmaterial.outcolor",
+                           blender, "materialblender.layercolor1")
+                gb.connect(mul_mask, "rsmathmul.out",
+                           blender, "materialblender.blendcolor1")
+                gb.connect(blender, "materialblender.out",
+                           output_node, RS_OUTPUT_NODE + ".surface")
+
+                # Console note only - the empty texture node is intentional, so
+                # this is not a warning the summary dialog needs to nag about.
+                print("[Material Creator] [{}] 'Curvature Texture' is empty by "
+                      "design. An unassigned texture sampler outputs black, so "
+                      "the curvature mask reads zero until a map is loaded into "
+                      "it.".format(material_name))
+
+            tr.Commit()
+        except Exception as exc:
+            tr.Rollback()
+            gb.warn("graph build failed, changes rolled back ({})".format(exc))
+            return None, gb.warnings
+
+    # Inserted only once the graph is complete, so the material appears fully
+    # built and a single undo step removes it.
+    doc.InsertMaterial(mat)
+    try:
+        doc.AddUndo(c4d.UNDOTYPE_NEW, mat)
+    except Exception:
+        pass  # called outside a StartUndo/EndUndo block - not fatal
+    c4d.EventAdd()
+    return mat, gb.warnings
+
+
+# Fixed gadget widths.
+#
+# A Cinema 4D checkbox whose initw is narrower than its label gets CLIPPED,
+# not wrapped, and the full text only shows in the tooltip. Both of these are
+# sized off the LONGEST label in their column with room to spare, so they hold
+# up at other UI scales and font settings too:
+#   channels - "Displacement"
+#   options  - "Game Asset"
+# Anything else in the dialog uses initw=0, which sizes itself to its text.
+CHANNEL_LABEL_WIDTH = 150
+
+# Column 1 is deliberately wider than it needs to be, which is also what keeps
+# columns 2 and 3 clear of it.
+OPT_COL_1 = 165
+OPT_COL_2 = 150
+OPT_COL_3 = 170
+
+
+# --------------------------------------------------
+# Copy Textures
+# --------------------------------------------------
+def safe_folder_name(name):
+    """A material name reduced to something safe to use as a folder name."""
+    cleaned = re.sub(r'[<>:"/\\|?*]', "_", name or "").strip(" .")
+    return cleaned or "material"
+
+
+def copy_material_textures(material_sets, destination_root):
+    """
+    Copy every referenced map into <destination_root>/tex/<material name>/ and
+    repoint the material sets at the copies.
+
+    One folder per material on purpose: v1.8 copied every map into a single
+    flat 'tex' folder with shutil.copy2, so two texture sets that both export
+    a file called BaseColor.png silently overwrote each other and the second
+    material ended up pointing at the first one's map.
+    """
+    warnings = []
+    if not destination_root:
+        return ["Copy Textures: no project folder to copy into - skipped."]
+
+    for key, ms_content in material_sets.items():
+        folder = os.path.join(destination_root, "tex",
+                              safe_folder_name(ms_content.get("materialName")))
+        for channel in MATERIAL_CHANNELS:
+            source = ms_content.get(channel)
+            if not source or not isinstance(source, str):
+                continue
+            destination = os.path.join(folder, os.path.basename(source))
+            try:
+                if os.path.abspath(source) == os.path.abspath(destination):
+                    continue
+                if not os.path.isdir(folder):
+                    os.makedirs(folder)
+                shutil.copy2(source, destination)
+                material_sets[key][channel] = destination
+            except Exception as exc:
+                warnings.append("could not copy '{}' ({})".format(
+                    os.path.basename(source), exc))
+    return warnings
+
+
+# --------------------------------------------------
+# Update an existing material in place
+# --------------------------------------------------
+EXISTING_CREATE_NEW = 0
+EXISTING_UPDATE = 1
+EXISTING_SKIP = 2
+
+
+def update_material_textures(mat, file_paths):
+    """
+    Repoint the texture paths of a material this tool built earlier, leaving
+    the rest of the graph - ramp tweaks, colour corrections, curvature
+    settings - untouched.
+
+    Nodes are found by the names the builder gives them ("BaseColor Tex" and
+    friends), so this only works on generated materials. Returns
+    (ok, warnings).
+    """
+    warnings = []
+    name = mat.GetName()
+
+    node_material = mat.GetNodeMaterialReference()
+    if node_material is None or not node_material.HasSpace(RS_NODESPACE):
+        return False, ["'{}' is not a Redshift node material - not updated.".format(name)]
+
+    graph = node_material.GetGraph(RS_NODESPACE)
+    if graph is None or graph.IsNullValue():
+        return False, ["'{}' has no Redshift graph - not updated.".format(name)]
+
+    nodes = []
+    try:
+        graph.GetRoot().GetInnerNodes(
+            maxon.NODE_KIND.NODE, False,
+            lambda node: (nodes.append(node), True)[1])
+    except Exception as exc:
+        return False, ["'{}' - could not read the graph ({}).".format(name, exc)]
+
+    by_name = {}
+    for node in nodes:
+        try:
+            node_name = str(node.GetValue(maxon.NODE.BASE.NAME))
+        except Exception:
+            continue
+        if node_name:
+            by_name[node_name] = node
+
+    gb = GraphBuilder(graph, name)
+    missing = []
+    changed = 0
+    with graph.BeginTransaction() as tr:
+        try:
+            for channel in MATERIAL_CHANNELS:
+                path = file_paths.get(channel)
+                if not path:
+                    continue
+                node = by_name.get("{} Tex".format(channel))
+                if node is None:
+                    missing.append(channel)
+                    continue
+                gb.set_texture(node, path, CHANNEL_COLORSPACES.get(
+                    channel, "RS_INPUT_COLORSPACE_RAW"))
+                changed += 1
+            tr.Commit()
+        except Exception as exc:
+            tr.Rollback()
+            return False, ["'{}' - update failed, rolled back ({}).".format(name, exc)]
+
+    warnings.extend(gb.warnings)
+    if missing:
+        warnings.append("'{}' has no node for {} - those channels were not "
+                        "updated. Set 'If material exists' to 'Create new' to "
+                        "rebuild it.".format(name, ", ".join(missing)))
+    c4d.EventAdd()
+    return changed > 0, warnings
+
+
+# --------------------------------------------------
+# Folder scan (module level so it can be tested without opening the dialog)
+# --------------------------------------------------
+CHANNEL_ORDER = ["BaseColor", "AO", "Metalness", "Roughness", "Opacity",
+                 "Normal", "Displacement"]
+
+
+def scan_folder(folder, channel_keywords, recursive=True):
+    """
+    Walk `folder` and group texture files into material sets.
+
+    channel_keywords: {"BaseColor": ["BaseColor", "Albedo"], ...} - only the
+                      channels present in this dict are searched.
+
+    Returns (channel_files, display_names, set_folders):
+        channel_files[channel][key] -> absolute file path
+        display_names[key]          -> identifier with its original spelling
+        set_folders[key]            -> folder the set's first map was found in,
+                                       used to pair models with materials
+
+    `key` is a case/separator-insensitive form of the identifier, so
+    "Wood_Planks_BaseColor.png" and "wood planks rough.png" still end up in
+    the same material.
+    """
+    channel_files = {ch: {} for ch in channel_keywords}
+    display_names = {}
+    set_folders = {}
+
+    if recursive:
+        walked = []
+        for root, dirs, files in os.walk(folder):
+            dirs.sort()
+            for fn in sorted(files):
+                walked.append((root, fn))
+    else:
+        walked = [(folder, fn) for fn in sorted(os.listdir(folder))]
+
+    for root, fn in walked:
+        full_path = os.path.join(root, fn)
+        if not os.path.isfile(full_path):
+            continue
+        if os.path.splitext(fn)[1].lower() not in TEXTURE_EXTENSIONS:
+            continue
+
+        for ch, keywords in channel_keywords.items():
+            boundary = ch in BOUNDARY_MATCH_CHANNELS
+            for kw in keywords:
+                ident = extract_identifier(fn, kw, require_boundary=boundary)
+                if ident is None:
+                    continue
+                if ch == "Normal":
+                    ident = strip_normal_format_tokens(ident)
+                key = identifier_key(ident)
+                channel_files[ch][key] = full_path
+                # Keep the first spelling we saw for this material.
+                if key not in display_names or (ident and not display_names[key]):
+                    display_names[key] = ident
+                set_folders.setdefault(key, root)
+                break
+
+    return channel_files, display_names, set_folders
+
+
+def folder_candidates(model_folder, set_folders):
+    """
+    Which material sets belong to the folder a model was imported from.
+
+    Returns the closest matches as a list of keys (usually one, empty when no
+    set shares a folder line with the model). Closeness is:
+        0  the set's textures sit in the same folder as the model
+        n  one is inside the other, n folders deep
+
+    This is what makes "one folder per asset" work without relying on the
+    object names inside the FBX being tidy.
+    """
+    if not model_folder or not set_folders:
+        return []
+    model = os.path.normcase(os.path.abspath(model_folder)).rstrip(os.sep)
+    scored = []
+    for key, folder in set_folders.items():
+        if not folder:
+            continue
+        other = os.path.normcase(os.path.abspath(folder)).rstrip(os.sep)
+        if other == model:
+            scored.append((0, key))
+        elif other.startswith(model + os.sep):
+            scored.append((1 + other[len(model) + 1:].count(os.sep), key))
+        elif model.startswith(other + os.sep):
+            scored.append((1 + model[len(other) + 1:].count(os.sep), key))
+    if not scored:
+        return []
+    best = min(score for score, _ in scored)
+    return sorted(key for score, key in scored if score == best)
+
+
+def name_candidate(object_name, keys):
+    """
+    The material key that appears inside an object's name, longest wins.
+    Case and separators are ignored on both sides. None when nothing matches.
+    """
+    obj_key = identifier_key(object_name)
+    best = None
+    for key in keys:
+        if key and key in obj_key:
+            if best is None or len(key) > len(best):
+                best = key
+    return best
+
+
+def build_material_name(base, ident):
+    if base and ident:
+        return "{}_{}".format(base, ident)
+    return ident or base or "RS Material"
+
+
+# --------------------------------------------------
+# UI Dialog for File Selection & Texture Search
+# --------------------------------------------------
+class MyDialog(gui.GeDialog):
+    MATERIAL_NAME_INPUT = 1005
+    FOLDER_INPUT = 1002
+    SELECT_FOLDER_BUTTON = 1003
+    IMPORT_3D_MODEL_CHECKBOX = 4001
+    AO_CHECKBOX = 4002
+    COPY_TEXTURES_CHECKBOX = 4003
+    GAME_ASSET_CHECKBOX = 4004
+    FLIP_GREEN_CHECKBOX = 4005
+    TRIPLANAR_CHECKBOX = 4006
+    TRIPLANAR_SIZE_INPUT = 4007
+    CURVATURE_CHECKBOX = 4009
+    EXISTING_POLICY_COMBO = 4014
+    STATUS_TEXT = 4015
+    CREATE_MATERIAL_BUTTON = 1001
+    PREVIEW_MATERIAL_BUTTON = 1006
+
+    CHECKBOX_IDS = {
+        "BaseColor": 2001,
+        "Metalness": 2007,
+        "Roughness": 2003,
+        "Opacity": 2006,
+        "Normal": 2004,
+        "Displacement": 2005
+    }
+    TEXTBOX_IDS = {
+        "BaseColor": 3001,
+        "Metalness": 3007,
+        "Roughness": 3003,
+        "Opacity": 3006,
+        "Normal": 3004,
+        "Displacement": 3005
+    }
+
+    def CreateLayout(self):
+        self.SetTitle("Redshift Material Creator  v{}".format(__version__))
+
+        # ---- Source ------------------------------------------------
+        self.GroupBegin(9000, c4d.BFH_SCALEFIT, 1, 0, "Source")
+        self.GroupBorder(c4d.BORDER_GROUP_IN)
+        self.GroupBorderSpace(6, 4, 6, 6)
+
+        self.GroupBegin(9020, c4d.BFH_SCALEFIT, 3, 1)
+        self.AddStaticText(9001, c4d.BFH_LEFT, 0, 15, name="Material Name:")
+        self.AddEditText(self.MATERIAL_NAME_INPUT, c4d.BFH_SCALEFIT, 200, 15)
+        # A plain hint, not a value. GeDialog has no placeholder text, so an
+        # empty field plus a label beside it is the honest way to say what
+        # happens when you leave it blank.
+        self.AddStaticText(9021, c4d.BFH_LEFT, 0, 15,
+                           name="blank = texture name")
+        self.GroupEnd()
+
+        self.GroupBegin(1000, c4d.BFH_SCALEFIT, 3, 1)
+        self.AddStaticText(1010, c4d.BFH_LEFT, 0, 15, name="Folder:")
+        self.AddEditText(self.FOLDER_INPUT, c4d.BFH_SCALEFIT, 240, 15)
+        self.AddButton(self.SELECT_FOLDER_BUTTON, c4d.BFH_RIGHT, 100, 15,
+                       "Select Folder")
+        self.GroupEnd()
+        self.GroupEnd()
+
+        # ---- Texture channels --------------------------------------
+        self.GroupBegin(5000, c4d.BFH_SCALEFIT, 2, 0, "Texture Channels")
+        self.GroupBorder(c4d.BORDER_GROUP_IN)
+        self.GroupBorderSpace(6, 4, 6, 6)
+        for ch in self.CHECKBOX_IDS:
+            self.AddCheckbox(self.CHECKBOX_IDS[ch], c4d.BFH_LEFT,
+                             CHANNEL_LABEL_WIDTH, 15, ch)
+            self.AddEditText(self.TEXTBOX_IDS[ch], c4d.BFH_SCALEFIT, 260, 15)
+        self.GroupEnd()
+
+        # ---- Options -----------------------------------------------
+        # A 3x3 grid so the checkboxes line up in columns instead of
+        # wrapping wherever they land.
+        self.GroupBegin(8000, c4d.BFH_SCALEFIT, 3, 3, "Options")
+        self.GroupBorder(c4d.BORDER_GROUP_IN)
+        self.GroupBorderSpace(6, 4, 6, 6)
+
+        self.AddCheckbox(self.TRIPLANAR_CHECKBOX, c4d.BFH_LEFT, OPT_COL_1, 15,
+                         "Triplanar")
+        self.GroupBegin(8110, c4d.BFH_LEFT, 2, 1)
+        self.AddStaticText(8101, c4d.BFH_LEFT, 0, 15, name="Size:")
+        self.AddEditNumberArrows(self.TRIPLANAR_SIZE_INPUT, c4d.BFH_LEFT, 70, 15)
+        self.GroupEnd()
+        self.AddStaticText(8102, c4d.BFH_LEFT, 0, 15, name="")
+
+        self.AddCheckbox(self.CURVATURE_CHECKBOX, c4d.BFH_LEFT, OPT_COL_1, 15,
+                         "Curvature")
+        self.AddCheckbox(self.AO_CHECKBOX, c4d.BFH_LEFT, OPT_COL_2, 15, "AO")
+        self.AddCheckbox(self.FLIP_GREEN_CHECKBOX, c4d.BFH_LEFT, OPT_COL_3, 15,
+                         "Flip Green (DirectX)")
+
+        self.AddCheckbox(self.GAME_ASSET_CHECKBOX, c4d.BFH_LEFT, OPT_COL_1, 15,
+                         "Game Asset")
+        self.AddCheckbox(self.COPY_TEXTURES_CHECKBOX, c4d.BFH_LEFT, OPT_COL_2, 15,
+                         "Copy Textures")
+        self.AddCheckbox(self.IMPORT_3D_MODEL_CHECKBOX, c4d.BFH_LEFT, OPT_COL_3, 15,
+                         "Import 3D Model")
+        self.GroupEnd()
+
+        # ---- Run ---------------------------------------------------
+        self.GroupBegin(8400, c4d.BFH_SCALEFIT, 2, 1)
+        self.AddStaticText(8401, c4d.BFH_LEFT, 0, 15, name="If material exists:")
+        self.AddComboBox(self.EXISTING_POLICY_COMBO, c4d.BFH_LEFT, 170, 15)
+        self.AddChild(self.EXISTING_POLICY_COMBO, EXISTING_UPDATE,
+                      "Update texture paths")
+        self.AddChild(self.EXISTING_POLICY_COMBO, EXISTING_CREATE_NEW, "Create new")
+        self.AddChild(self.EXISTING_POLICY_COMBO, EXISTING_SKIP, "Skip")
+        self.GroupEnd()
+
+        self.GroupBegin(9010, c4d.BFH_CENTER, 2, 1)
+        self.AddButton(self.CREATE_MATERIAL_BUTTON, c4d.BFH_CENTER, 130, 15,
+                       "Create Material")
+        self.AddButton(self.PREVIEW_MATERIAL_BUTTON, c4d.BFH_CENTER, 130, 15,
+                       "Preview Materials")
+        self.GroupEnd()
+
+        self.AddStaticText(self.STATUS_TEXT, c4d.BFH_SCALEFIT, 0, 15, name="")
+
+        return True
+
+    def InitValues(self):
+        self.SetString(self.FOLDER_INPUT, "")
+        # Blank by default: the material is then named after the texture set,
+        # which is what you want most of the time.
+        self.SetString(self.MATERIAL_NAME_INPUT, "")
+        default_texts = {
+            "BaseColor": "BaseColor, Albedo",
+            "Roughness": "Roughness, Rough",
+            "Normal": "Normal, Nrm",
+            "Displacement": "Displacement, Height",
+            "Opacity": "Opacity, Alpha",
+            "Metalness": "Metalness, Metallic, Mtl"
+        }
+        for ch, cb in self.CHECKBOX_IDS.items():
+            default_state = False if ch in ("Opacity", "Metalness") else True
+            self.SetBool(cb, default_state)
+            self.SetString(self.TEXTBOX_IDS[ch], default_texts[ch])
+            self.Enable(self.TEXTBOX_IDS[ch], True)
+
+        self.SetBool(self.IMPORT_3D_MODEL_CHECKBOX, False)
+        self.SetBool(self.AO_CHECKBOX, False)
+        self.SetBool(self.COPY_TEXTURES_CHECKBOX, False)
+        self.SetBool(self.GAME_ASSET_CHECKBOX, False)
+        # Off by default. Substance does export DirectX normals, but plenty of
+        # sources are already OpenGL and a wrong flip is harder to spot than a
+        # missing one - so this is opt-in.
+        self.SetBool(self.FLIP_GREEN_CHECKBOX, False)
+
+        # Triplanar ignores UVs entirely, so it must be opt-in: turning it on
+        # for a model with baked UVs would quietly destroy the look.
+        self.SetBool(self.TRIPLANAR_CHECKBOX, False)
+        # Redshift's own triplanar scale. Smaller number, bigger texture.
+        self.SetFloat(self.TRIPLANAR_SIZE_INPUT, TRIPLANAR_DEFAULT_SIZE,
+                      0.000001, 1000000.0, 0.001)
+
+        self.SetBool(self.CURVATURE_CHECKBOX, False)
+        self.SetInt32(self.EXISTING_POLICY_COMBO, EXISTING_UPDATE)
+        self.SetString(self.STATUS_TEXT, "")
+        self.sync_enabled_state()
+
+        self.result = None
+        return True
+
+    def sync_enabled_state(self):
+        """
+        Only the Size field, which is meaningless with Triplanar off.
+
+        AO and Curvature are deliberately NOT mutually exclusive - v1.9 greyed
+        AO out when Curvature was ticked, which was a judgement call the tool
+        had no business making. They do different things to different parts of
+        the graph and running both is a legitimate look.
+        """
+        self.Enable(self.TRIPLANAR_SIZE_INPUT, self.GetBool(self.TRIPLANAR_CHECKBOX))
+
+    def status(self, message):
+        self.SetString(self.STATUS_TEXT, message)
+
+    # ----------------------------------------------
+    # Folder scan (shared by Preview and Create)
+    # ----------------------------------------------
+    def collect_keywords(self):
+        """Enabled channels and their keyword lists, as typed in the dialog."""
+        channel_keywords = {}
+        for ch in self.CHECKBOX_IDS:
+            if not self.GetBool(self.CHECKBOX_IDS[ch]):
+                continue
+            keywords = [k.strip() for k in self.GetString(self.TEXTBOX_IDS[ch]).split(',')]
+            channel_keywords[ch] = [k for k in keywords if k]
+
+        # AO has no row of its own. Its keywords are fixed and are only
+        # searched for when the AO checkbox is on, so a set with no AO map
+        # simply falls through to the procedural node.
+        if self.GetBool(self.AO_CHECKBOX):
+            channel_keywords["AO"] = list(AO_KEYWORDS)
+
+        return channel_keywords
+
+    def extra_options(self):
+        """Everything on the dialog that is not a texture channel."""
+        return {
+            "ao": self.GetBool(self.AO_CHECKBOX),
+            "gameAsset": self.GetBool(self.GAME_ASSET_CHECKBOX),
+            "flipGreen": self.GetBool(self.FLIP_GREEN_CHECKBOX),
+            "triplanar": self.GetBool(self.TRIPLANAR_CHECKBOX),
+            "triplanarSize": self.GetFloat(self.TRIPLANAR_SIZE_INPUT),
+            "curvature": self.GetBool(self.CURVATURE_CHECKBOX),
+            "existingPolicy": self.GetInt32(self.EXISTING_POLICY_COMBO),
+        }
+
+    def scan(self, folder):
+        # Subfolders are always included - texture sets are normally exported
+        # one folder per material.
+        return scan_folder(folder, self.collect_keywords())
+
+    def Command(self, id, msg):
+        if id == self.SELECT_FOLDER_BUTTON:
+            folder = storage.LoadDialog(title="Select a Folder", flags=c4d.FILESELECT_DIRECTORY)
+            if folder:
+                self.SetString(self.FOLDER_INPUT, folder)
+
+        if id == self.PREVIEW_MATERIAL_BUTTON:
+            folder = self.GetString(self.FOLDER_INPUT).strip()
+            if not folder or not os.path.exists(folder):
+                gui.MessageDialog("Please select a valid folder.")
+                return True
+
+            channel_files, display_names, set_folders = self.scan(folder)
+            channels = [ch for ch in CHANNEL_ORDER if ch in channel_files]
+
+            keys = set()
+            for ch in channels:
+                keys |= set(channel_files[ch].keys())
+            if not keys:
+                gui.MessageDialog("No texture files found.")
+                return True
+
+            base = self.GetString(self.MATERIAL_NAME_INPUT).strip()
+            opts = self.extra_options()
+            preview = "Normal source: {}\n".format(
+                "DirectX (green channel flipped)" if opts["flipGreen"]
+                else "OpenGL (unchanged)"
+            )
+            preview += "Triplanar: {}\n".format(
+                "on, size {:g}".format(opts["triplanarSize"])
+                if opts["triplanar"] else "off"
+            )
+            preview += "Curvature blend: {}\n\n".format(
+                "on" if opts["curvature"] else "off")
+            for key in sorted(keys):
+                preview += "Material: {}\n".format(
+                    build_material_name(base, display_names.get(key, ""))
+                )
+                if self.GetBool(self.IMPORT_3D_MODEL_CHECKBOX):
+                    set_folder = set_folders.get(key, "")
+                    try:
+                        shown = os.path.relpath(set_folder, folder)
+                    except Exception:
+                        shown = set_folder
+                    preview += "  folder: {}\n".format(
+                        "." if shown in ("", ".") else shown)
+                for ch in channels:
+                    if channel_files[ch].get(key):
+                        preview += "  {}: {}\n".format(
+                            ch, os.path.basename(channel_files[ch][key])
+                        )
+                preview += "\n"
+
+            # A scrollable read-only dialog, not gui.MessageDialog - with
+            # thirty texture sets that string is unreadable and can truncate.
+            PreviewDialog(preview).Open(dlgtype=c4d.DLG_TYPE_MODAL,
+                                        defaultw=620, defaulth=460)
+
+        if id == self.TRIPLANAR_CHECKBOX:
+            self.sync_enabled_state()
+
+        if id == self.CREATE_MATERIAL_BUTTON:
+            folder = self.GetString(self.FOLDER_INPUT).strip()
+            if not folder or not os.path.exists(folder):
+                gui.MessageDialog("Please select a valid folder.")
+                return True
+
+            channel_files, display_names, set_folders = self.scan(folder)
+            channels = [ch for ch in CHANNEL_ORDER if ch in channel_files]
+
+            keys = set()
+            for ch in channels:
+                keys |= set(channel_files[ch].keys())
+            if not keys:
+                gui.MessageDialog("No texture files found.")
+                return True
+
+            materialSets = {}
+            base = self.GetString(self.MATERIAL_NAME_INPUT).strip()
+            for key in sorted(keys):
+                ident = display_names.get(key, "")
+                ms = {ch: channel_files[ch].get(key) for ch in channels}
+                ms["materialName"] = build_material_name(base, ident)
+                ms["identifier"] = ident
+                ms["sourceFolder"] = set_folders.get(key, "")
+                ms.update(self.extra_options())
+                materialSets[key] = ms
+
+            settings = {
+                "materialSets": materialSets,
+                "folder": folder,
+                "importObject": self.GetBool(self.IMPORT_3D_MODEL_CHECKBOX),
+                "copyTextures": self.GetBool(self.COPY_TEXTURES_CHECKBOX),
+                "gameAsset": self.GetBool(self.GAME_ASSET_CHECKBOX),
+                "flipGreen": self.GetBool(self.FLIP_GREEN_CHECKBOX),
+                "existingPolicy": self.GetInt32(self.EXISTING_POLICY_COMBO),
+            }
+            self.result = settings
+
+            # The dialog is async and stays open - the work happens here
+            # rather than after Close(), so you can adjust and run again.
+            self.Enable(self.CREATE_MATERIAL_BUTTON, False)
+            try:
+                report = build_materials(settings, status=self.status)
+            finally:
+                self.Enable(self.CREATE_MATERIAL_BUTTON, True)
+            self.status(format_report_line(report))
+            report_problems(report)
+
+        return True
+
+
+# --------------------------------------------------
+# Preview dialog
+# --------------------------------------------------
+class PreviewDialog(gui.GeDialog):
+    TEXT = 2000
+
+    def __init__(self, text):
+        super(PreviewDialog, self).__init__()
+        self._text = text
+
+    def CreateLayout(self):
+        self.SetTitle("Preview Materials")
+        self.AddMultiLineEditText(
+            self.TEXT, c4d.BFH_SCALEFIT | c4d.BFV_SCALEFIT, 600, 420,
+            c4d.DR_MULTILINE_READONLY | c4d.DR_MULTILINE_MONOSPACED)
+        self.AddDlgGroup(c4d.DLG_OK)
+        return True
+
+    def InitValues(self):
+        self.SetString(self.TEXT, self._text)
+        return True
+
+    def Command(self, id, msg):
+        # AddDlgGroup only draws the button - without this the OK click was
+        # swallowed and the window just sat there.
+        if id in (c4d.DLG_OK, c4d.DLG_CANCEL):
+            self.Close()
+        return True
+
+
+# --------------------------------------------------
+# Model import
+# --------------------------------------------------
+def import_models(doc, folder, created_materials, material_sets=None):
+    """
+    Import every .fbx / .obj under `folder` and give each object the material
+    that belongs to it.
+
+    Two ways to decide which material that is, in order:
+
+      1. FOLDER. Each material set remembers the folder its textures were
+         found in. A model imported from that same folder (or from its
+         parent/child) gets that set's material. This is what makes the
+         common "one folder per asset" layout work without depending on the
+         object names inside the FBX being tidy.
+      2. NAME. Failing that, the material whose identifier appears inside the
+         object's name, longest match winning - the v1.1 behaviour, kept as
+         the fallback for assets that all sit in one folder together.
+
+    An object that matches neither is left alone and reported, rather than
+    given an arbitrary material.
+    """
+    warnings = []
+    if not folder or not os.path.isdir(folder):
+        return ["Import 3D Model: '{}' is not a folder.".format(folder)]
+
+    material_sets = material_sets or {}
+    set_folders = {key: (ms.get("sourceFolder") or "")
+                   for key, ms in material_sets.items()
+                   if key in created_materials}
+
+    model_files = []
+    for root, dirs, files in os.walk(folder):
+        dirs.sort()
+        for fn in sorted(files):
+            if fn.lower().endswith((".fbx", ".obj")):
+                model_files.append(os.path.join(root, fn))
+
+    # Imported one file at a time, so every object can be traced back to the
+    # folder it came from. A single merge at the end loses that.
+    imported = []   # [(object, folder it was imported from)]
+    for path in model_files:
+        before = get_all_objects(doc.GetFirstObject()) if doc.GetFirstObject() else []
+        c4d.documents.MergeDocument(doc, path, c4d.SCENEFILTER_OBJECTS)
+        after = get_all_objects(doc.GetFirstObject()) if doc.GetFirstObject() else []
+        model_folder = os.path.dirname(path)
+        for obj in after:
+            if obj not in before:
+                imported.append((obj, model_folder))
+
+    only_material = None
+    if len(created_materials) == 1:
+        only_material = list(created_materials.values())[0]
+
+    matched_by = {"only": 0, "folder": 0, "name": 0}
+
+    for obj, model_folder in imported:
+        try:
+            doc.AddUndo(c4d.UNDOTYPE_NEW, obj)
+        except Exception:
+            pass
+
+        material_to_apply = None
+
+        if only_material is not None:
+            material_to_apply = only_material
+            matched_by["only"] += 1
+        else:
+            candidates = folder_candidates(model_folder, set_folders)
+            if len(candidates) == 1:
+                material_to_apply = created_materials.get(candidates[0])
+                matched_by["folder"] += 1
+            elif len(candidates) > 1:
+                # Several sets share that folder - let the object's name pick
+                # between them before widening the search.
+                key = name_candidate(obj.GetName(), candidates) \
+                    or name_candidate(obj.GetName(), created_materials.keys())
+                if key is not None:
+                    material_to_apply = created_materials.get(key)
+                    matched_by["name"] += 1
+                else:
+                    warnings.append(
+                        "'{}' - {} texture sets share its folder and its name "
+                        "matches none of them, so no texture tag was added"
+                        .format(obj.GetName(), len(candidates)))
+                    continue
+            else:
+                key = name_candidate(obj.GetName(), created_materials.keys())
+                if key is not None:
+                    material_to_apply = created_materials.get(key)
+                    matched_by["name"] += 1
+
+        if material_to_apply is None:
+            warnings.append("no matching material for object '{}' - no "
+                            "texture tag added".format(obj.GetName()))
+            continue
+
+        tag = c4d.BaseTag(c4d.Ttexture)
+        tag[c4d.TEXTURETAG_MATERIAL] = material_to_apply
+        # Textures are UV-mapped; the default projection would be Spherical,
+        # which stretches the maps across the model.
+        tag[c4d.TEXTURETAG_PROJECTION] = c4d.TEXTURETAG_PROJECTION_UVW
+
+        # LAST, not first. InsertTag() with no predecessor puts the tag at the
+        # front of the list, and Cinema 4D gives precedence to the RIGHTMOST
+        # texture tag - so an FBX that carries its own materials would have
+        # overridden ours.
+        existing = obj.GetTags()
+        if existing:
+            obj.InsertTag(tag, existing[-1])
+        else:
+            obj.InsertTag(tag)
+
+    if imported:
+        print("[Material Creator] tagged {} object(s) - {} by folder, {} by "
+              "name, {} single-material".format(
+                  matched_by["folder"] + matched_by["name"] + matched_by["only"],
+                  matched_by["folder"], matched_by["name"], matched_by["only"]))
+
+    return warnings
+
+
+# --------------------------------------------------
+# The build
+# --------------------------------------------------
+def build_materials(settings, status=None):
+    """
+    Create / update every material in `settings["materialSets"]`.
+
+    The whole batch is one undo step, and progress goes to Cinema 4D's status
+    bar (which repaints during a long loop, unlike a dialog gadget) plus the
+    optional `status` callback.
+    """
+    def say(message):
+        if status:
+            try:
+                status(message)
+            except Exception:
+                pass
+
+    report = {"created": 0, "updated": 0, "skipped": 0,
+              "failed": [], "warnings": []}
+
+    doc = c4d.documents.GetActiveDocument()
+    if doc is None:
+        report["warnings"].append("No active document.")
+        return report
+
+    material_sets = settings.get("materialSets") or {}
+    if not material_sets:
+        return report
+
+    if settings.get("copyTextures"):
+        destination = doc.GetDocumentPath() or settings.get("folder")
+        report["warnings"].extend(
+            copy_material_textures(material_sets, destination))
+
+    policy = settings.get("existingPolicy", EXISTING_UPDATE)
+    created_materials = {}
+    items = sorted(material_sets.items())
+    total = len(items)
+
+    doc.StartUndo()
+    try:
+        for index, (key, ms_content) in enumerate(items):
+            name = ms_content.get("materialName", "RS Material")
+            progress = "{}/{}  {}".format(index + 1, total, name)
+            say(progress)
+            c4d.StatusSetText("Redshift Material Creator: " + progress)
+            c4d.StatusSetBar(int(100.0 * index / total))
+
+            existing = doc.SearchMaterial(name)
+
+            if existing is not None and policy == EXISTING_SKIP:
+                report["skipped"] += 1
+                continue
+
+            if existing is not None and policy == EXISTING_UPDATE:
+                try:
+                    doc.AddUndo(c4d.UNDOTYPE_CHANGE, existing)
+                except Exception:
+                    pass
+                ok, warnings = update_material_textures(existing, ms_content)
+                report["warnings"].extend(warnings)
+                if ok:
+                    report["updated"] += 1
+                    created_materials[key] = existing
+                else:
+                    report["failed"].append(name)
+                continue
+
+            data = ms_content.copy()
+            data["gameAsset"] = settings.get("gameAsset", False)
+            data["flipGreen"] = settings.get("flipGreen", False)
+            mat, warnings = create_redshift_material(data)
+            report["warnings"].extend(warnings)
+            if mat:
+                report["created"] += 1
+                created_materials[key] = mat
+            else:
+                report["failed"].append(name)
+
+        if settings.get("importObject") and created_materials:
+            say("importing models")
+            c4d.StatusSetText("Redshift Material Creator: importing models")
+            report["warnings"].extend(
+                import_models(doc, settings.get("folder"), created_materials,
+                              material_sets))
+    finally:
+        doc.EndUndo()
+        c4d.StatusClear()
+        c4d.EventAdd()
+
+    return report
+
+
+def format_report_line(report):
+    bits = []
+    for label in ("created", "updated", "skipped"):
+        if report[label]:
+            bits.append("{} {}".format(report[label], label))
+    if report["failed"]:
+        bits.append("{} failed".format(len(report["failed"])))
+    if not bits:
+        bits.append("nothing to do")
+    if report["warnings"]:
+        bits.append("{} warning{}".format(
+            len(report["warnings"]), "" if len(report["warnings"]) == 1 else "s"))
+    return ", ".join(bits)
+
+
+def report_problems(report):
+    """
+    Console always; a dialog ONLY when something went wrong. A clean run says
+    nothing - the materials showing up in the Material Manager is enough.
+    """
+    print("[Material Creator] " + format_report_line(report))
+    for warning in report["warnings"]:
+        print("[Material Creator] " + warning)
+
+    if not report["failed"] and not report["warnings"]:
+        return
+
+    summary = format_report_line(report)
+    if report["failed"]:
+        summary += "\n\nFailed: {}".format(", ".join(report["failed"]))
+    if report["warnings"]:
+        # The same problem usually repeats once per material, so collapse
+        # identical messages (minus their "[material name] " prefix) rather
+        # than printing thirty copies of one line.
+        counts = {}
+        order = []
+        for warning in report["warnings"]:
+            msg = warning.split("] ", 1)[1] if warning.startswith("[") \
+                and "] " in warning else warning
+            if msg not in counts:
+                counts[msg] = 0
+                order.append(msg)
+            counts[msg] += 1
+        summary += "\n\n{} warning{}:\n".format(
+            len(order), "" if len(order) == 1 else "s")
+        shown = order[:10]
+        summary += "\n".join(
+            "  - {}{}".format(m, "" if counts[m] == 1 else
+                              "  (x{})".format(counts[m])) for m in shown)
+        if len(order) > len(shown):
+            summary += "\n  ... and {} more (see the console).".format(
+                len(order) - len(shown))
+    gui.MessageDialog(summary)
+
+
+# --------------------------------------------------
+# Entry points
+#
+# ONE file, two ways in:
+#   * Script Manager - keep the .py extension, hit Execute. This stays a
+#     first-class way to run the tool.
+#   * Plugin - copy the file into a Cinema 4D "plugins" folder and rename it
+#     to .pyp. It then registers a command you can put in a menu or bind to a
+#     shortcut.
+# The extension is what decides, so the same file does both.
+# --------------------------------------------------
+PLUGIN_ID = 1065432   # TODO: replace with an id registered at
+                      # developers.maxon.net before sharing this with anyone.
+                      # Unregistered ids can collide with another plugin.
+
+_SCRIPT_DIALOG = None   # module-level so an async dialog opened from the
+                        # Script Manager is not garbage collected
+
+
+def open_tool():
+    global _SCRIPT_DIALOG
+    if _SCRIPT_DIALOG is None:
+        _SCRIPT_DIALOG = MyDialog()
+    _SCRIPT_DIALOG.Open(dlgtype=c4d.DLG_TYPE_ASYNC,
+                        defaultw=460, defaulth=440)
+    return True
+
+
+class RSMaterialCreatorCommand(c4d.plugins.CommandData):
+    def __init__(self):
+        self.dialog = None
+
+    def Execute(self, doc):
+        if self.dialog is None:
+            self.dialog = MyDialog()
+        return self.dialog.Open(dlgtype=c4d.DLG_TYPE_ASYNC, pluginid=PLUGIN_ID,
+                                defaultw=460, defaulth=440)
+
+    def RestoreLayout(self, sec_ref):
+        if self.dialog is None:
+            self.dialog = MyDialog()
+        return self.dialog.Restore(pluginid=PLUGIN_ID, secret=sec_ref)
+
+
+def register_plugin():
+    return c4d.plugins.RegisterCommandPlugin(
+        PLUGIN_ID,
+        "Redshift Material Creator",
+        0,
+        None,
+        "Batch-build Redshift materials from a folder of PBR texture maps",
+        RSMaterialCreatorCommand())
+
+
+class RedshiftMaterialImporterTool(object):
+    """Kept so older habits (and any script calling it) still work."""
+
+    def run(self):
+        return open_tool()
+
+
+def _running_as_plugin():
+    try:
+        return os.path.splitext(__file__)[1].lower() == ".pyp"
+    except NameError:
+        return False
+
+
+if __name__ == "__main__":
+    if _running_as_plugin():
+        register_plugin()
+    else:
+        open_tool()
